@@ -1,0 +1,33 @@
+{
+  "name": "dsh-login",
+  "version": "0.1.0",
+  "description": "DB-backed login gate for the DeepSeek Harness Web GUI — self-service register + login verified against a MySQL dsh-login table",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "login",
+    "registration",
+    "authentication",
+    "mysql",
+    "web-ui"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

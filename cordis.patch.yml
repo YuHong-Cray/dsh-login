@@ -1,0 +1,11 @@
+# dsh-login bundle patch — applied when the profile lists dsh-login in
+# dsh.profile.bundles. Mounts the DB-backed login gate over the Web server.
+#
+# This plugin owns user authentication (register/login verified against the
+# configured MySQL dsh-login table). Network binding (0.0.0.0) and the index
+# polyfills stay with dsh-lan-access. Deployment settings (database connection,
+# CIDR allowlist, session lifetime) live in $DSH_HOME/dsh-login.json.
+- insert:
+    - id: db-login
+      name: dsh-login
+      inject: [webServer, credentials]

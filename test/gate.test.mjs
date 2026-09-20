@@ -934,6 +934,77 @@ describe('dsh-login gate end-to-end (real MySQL)', () => {
     }
   })
 
+  it('admin model-policy route: guards, persistence, the mirror file, and the console cell', async () => {
+    const { LoginDatabase } = await import('../lib/db.js')
+    const { policyFromColumn, readModelPolicy } = await import('../lib/model-policy.js')
+    const adminName = `dsh-itest-poladm-${Date.now().toString(36)}`
+    const target = `dsh-itest-pol-${Date.now().toString(36)}`
+    const policyHome = await mkdtemp(join(tmpdir(), 'dsh-login-policy-'))
+    const policyRoot = await mkdtemp(join(tmpdir(), 'dsh-login-policyroot-'))
+    const db = new LoginDatabase(DB_CONFIG)
+    await db.ensureTable()
+    await db.register(adminName, hashPassword('Passw0rd-123'))
+    await db.register(target, hashPassword('Passw0rd-123'))
+    const gate = await startGate(policyHome, DB_CONFIG, {
+      adminUsers: [adminName],
+      instances: { root: policyRoot, portBase: 39001 },
+    })
+    try {
+      const post = (headers, body) => fetch(`${gate.baseUrl}/dsh-login/users/model-policy`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      })
+      // Anonymous callers are refused (this route answers JSON, not a redirect).
+      assert.equal((await post({}, { user: target, allow: true })).status, 401)
+
+      const login = await fetchManual(`${gate.baseUrl}/dsh-login/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: adminName, password: 'Passw0rd-123' }),
+      })
+      const cookie = `${COOKIE_NAME}=${gate.cookie(login, COOKIE_NAME)}`
+      // A foreign Origin is refused, a malformed `allow` is a 400, and an
+      // admin target has no switch (admins manage their own models on the hub).
+      assert.equal((await post({ cookie, origin: 'http://evil.example' }, { user: target, allow: true })).status, 403)
+      assert.equal((await post({ cookie, origin: gate.baseUrl }, { user: target, allow: 'maybe' })).status, 400)
+      assert.equal((await post({ cookie, origin: gate.baseUrl }, { user: adminName, allow: true })).status, 400)
+      assert.equal((await post({ cookie, origin: gate.baseUrl }, { user: 'nosuchuser-zz', allow: true })).status, 404)
+
+      // Default is DENIED: the column starts at 0 and no mirror file exists.
+      assert.equal(policyFromColumn((await db.findByUsername(target)).model_self_service), false)
+      assert.equal(await readModelPolicy(join(policyRoot, target)), false)
+
+      // Grant: the column AND the user's own mirror file both move.
+      const on = await post({ cookie, origin: gate.baseUrl }, { user: target, allow: true })
+      assert.equal(on.status, 200)
+      assert.equal((await on.json()).allow, true)
+      assert.equal(policyFromColumn((await db.findByUsername(target)).model_self_service), true)
+      assert.equal(await readModelPolicy(join(policyRoot, target)), true, 'the instance must see the grant')
+
+      // The console reflects the grant (badge + the revoke button).
+      const usersHtml = await (await fetch(`${gate.baseUrl}/dsh-login/users`, { headers: { cookie } })).text()
+      assert.match(usersHtml, /已允许/u)
+      assert.match(usersHtml, new RegExp(`data-policy="deny" data-user="${target}"`, 'u'))
+
+      // Revoke: both stores move back.
+      const off = await post({ cookie, origin: gate.baseUrl }, { user: target, allow: false })
+      assert.equal(off.status, 200)
+      assert.equal(policyFromColumn((await db.findByUsername(target)).model_self_service), false)
+      assert.equal(await readModelPolicy(join(policyRoot, target)), false)
+    } finally {
+      await gate.dispose()
+      try {
+        await db.remove(adminName)
+        await db.remove(target)
+      } finally {
+        db.close()
+      }
+      await rm(policyHome, { recursive: true, force: true })
+      await rm(policyRoot, { recursive: true, force: true })
+    }
+  })
+
   it('answers 503 with a friendly error when the database is down', async () => {
     const downHome = await mkdtemp(join(tmpdir(), 'dsh-login-down-'))
     const downFake = await startGate(downHome, { ...DB_CONFIG, host: '127.0.0.1', port: 1 })

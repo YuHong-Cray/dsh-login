@@ -18,7 +18,7 @@
 import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:http'
 import { mkdirSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -38,9 +38,17 @@ import {
   summarizeModelConfig,
   validateMyModels,
 } from '../lib/model-config.js'
-import { renderAccountPage, renderMyModelsPage } from '../lib/account-page.js'
+import { renderAccountPage, renderModelsClosedPage, renderMyModelsPage } from '../lib/account-page.js'
 import { innerCookieName, mintInnerCookie } from '../lib/inner.js'
 import { normalizeConfig, saveConfig } from '../lib/config.js'
+import {
+  MODEL_POLICY_FILE,
+  modelPolicyPath,
+  parseModelPolicy,
+  policyFromColumn,
+  readModelPolicy,
+  writeModelPolicy,
+} from '../lib/model-policy.js'
 
 // ---------------------------------------------------------------------------
 // unit: presets
@@ -360,6 +368,19 @@ describe('summarizeModelConfig + renderMyModelsPage', () => {
     assert.match(html, /data-del="my-gw"/)
   })
 
+  it('the closed page says the administrator switched the feature off, and leaks nothing', () => {
+    const html = renderModelsClosedPage({ port: 3100 })
+    assert.match(html, /管理员已关闭「模型设置」功能/)
+    assert.match(html, /请联系管理员/)
+    assert.ok(!html.includes('id="add-form"'), 'no add form on the closed page')
+    assert.ok(!html.includes('data-preset='), 'no preset buttons on the closed page')
+    assert.ok(!html.includes('data-del='), 'no delete control on the closed page')
+    assert.ok(!html.includes('data-df='), 'no set-default control on the closed page')
+    assert.ok(!html.includes('action="/dsh-login/models"'), 'no form target on the closed page')
+    // The closed page is a standalone card, not the models page.
+    assert.ok(!html.includes('已配置的 provider'), 'the closed page does not list providers')
+  })
+
   it('the page never contains a key, and user data is escaped', () => {
     const html = renderMyModelsPage({
       port: 3100,
@@ -381,10 +402,59 @@ describe('summarizeModelConfig + renderMyModelsPage', () => {
     assert.match(html, /checked/)
   })
 
-  it('the instance account page links to the models page', () => {
-    const html = renderAccountPage({ mode: 'instance', port: 3100 })
-    assert.match(html, /href="\/dsh-login\/models"/)
-    assert.match(html, /我的模型/)
+  it('the instance account page links to the models page only when it is open', () => {
+    const on = renderAccountPage({ mode: 'instance', port: 3100, allowSelfService: true })
+    assert.match(on, /href="\/dsh-login\/models"/)
+    assert.match(on, /我的模型/)
+    assert.match(on, /已允许自行设置/)
+    const off = renderAccountPage({ mode: 'instance', port: 3100, allowSelfService: false })
+    assert.match(off, /已被管理员关闭/)
+    assert.ok(!off.includes('href="/dsh-login/models"'), 'a closed endpoint must not be linked')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// unit: the administrator's per-user「自行设置模型」mirror
+// ---------------------------------------------------------------------------
+
+describe('model self-service policy mirror', () => {
+  it('parseModelPolicy accepts only an explicit allow', () => {
+    assert.equal(parseModelPolicy(JSON.stringify({ allowSelfService: true })), true)
+    assert.equal(parseModelPolicy(JSON.stringify({ allowSelfService: false })), false)
+    assert.equal(parseModelPolicy(JSON.stringify({ allowSelfService: 'true' })), false, 'strings are not an allow')
+    assert.equal(parseModelPolicy('{}'), false)
+    assert.equal(parseModelPolicy('not json'), false)
+    assert.equal(parseModelPolicy('[true]'), false)
+    assert.equal(parseModelPolicy(undefined), false)
+  })
+
+  it('policyFromColumn interprets the MySQL 0/1 column', () => {
+    assert.equal(policyFromColumn(1), true)
+    assert.equal(policyFromColumn('1'), true)
+    assert.equal(policyFromColumn(true), true)
+    assert.equal(policyFromColumn(0), false)
+    assert.equal(policyFromColumn('0'), false)
+    assert.equal(policyFromColumn(null), false)
+    assert.equal(policyFromColumn(undefined), false)
+  })
+
+  it('round-trips through a DSH_HOME and denies on every failure', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'dsh-login-policy-'))
+    try {
+      assert.equal(await readModelPolicy(home), false, 'a home without the file denies (upgrade default)')
+      assert.equal(await writeModelPolicy(home, true), true)
+      assert.equal(await readModelPolicy(home), true)
+      const raw = JSON.parse(await readFile(modelPolicyPath(home), 'utf8'))
+      assert.equal(raw.allowSelfService, true)
+      assert.equal(typeof raw.updatedAt, 'string')
+      assert.equal(await writeModelPolicy(home, false), false)
+      assert.equal(await readModelPolicy(home), false)
+      // Malformed content denies rather than throwing.
+      await writeFile(join(home, MODEL_POLICY_FILE), '{ broken')
+      assert.equal(await readModelPolicy(home), false)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
   })
 })
 
@@ -566,11 +636,15 @@ class FakeInstance {
   }
 }
 
-async function startInstance() {
+async function startInstance({ allowSelfService = true } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'dsh-login-my-'))
   const port = await getFreePort()
   const config = normalizeConfig({ instance: true, hubBase: 'http://127.0.0.1:3999/', port })
   saveConfig(home, config)
+  // The administrator's switch is MIRRORED into the DSH_HOME by the hub; a
+  // home without the file means DENIED (the upgrade default). The write-path
+  // tests grant it explicitly, exactly as an approving administrator would.
+  if (allowSelfService) await writeModelPolicy(home, true)
   process.env.DSH_HOME = home
   const fake = new FakeInstance()
   await fake.listenOn(port)
@@ -835,5 +909,68 @@ describe('instance /dsh-login/models (self-service)', () => {
       headers: { cookie: fake.cookieHeader() },
     })
     assert.equal(bad.status, 400)
+  })
+
+  it('the administrator switch CLOSES the whole endpoint (nothing written, nothing readable)', async () => {
+    const { fake, home } = await startInstance({ allowSelfService: false })
+    cleanups.push(async () => { await fake.dispose(); await rm(home, { recursive: true, force: true }) })
+
+    // GET answers the closed page (403): the endpoint is shut, not read-only.
+    const page = await fetch(`${fake.baseUrl}/dsh-login/models`, { headers: { cookie: fake.cookieHeader() } })
+    assert.equal(page.status, 403)
+    const html = await page.text()
+    assert.match(html, /管理员已关闭「模型设置」功能/)
+    assert.ok(!html.includes('id="add-form"'), 'the add form must not be offered')
+    assert.ok(!html.includes('已配置的 provider'), 'the closed page must not list providers')
+
+    // Every write route answers 403 and touches nothing.
+    const add = await formPost(`${fake.baseUrl}/dsh-login/models`, {
+      kind: 'preset',
+      presetId: 'deepseek',
+      apiKey: 'sk-fake-deepseek-denied',
+    }, { cookie: fake.cookieHeader(), origin: fake.baseUrl })
+    assert.equal(add.status, 403)
+    assert.match(await add.text(), /管理员已关闭「模型设置」功能/)
+
+    const del = await jsonPost(`${fake.baseUrl}/dsh-login/models/delete`, { id: 'my-gw' },
+      { cookie: fake.cookieHeader(), origin: fake.baseUrl })
+    assert.equal(del.status, 403)
+    assert.match((await del.json()).error, /尚未允许/)
+
+    const df = await jsonPost(`${fake.baseUrl}/dsh-login/models/default`, { provider: 'my-gw', model: 'm1' },
+      { cookie: fake.cookieHeader(), origin: fake.baseUrl })
+    assert.equal(df.status, 403)
+
+    // The catalog-read route is part of the same closed surface.
+    const catalog = await fetch(`${fake.baseUrl}/dsh-login/models/models-of?id=deepseek`,
+      { headers: { cookie: fake.cookieHeader() } })
+    assert.equal(catalog.status, 403)
+
+    assert.deepEqual(writesOf(fake), [], 'a closed user must not cause a single settings/credentials write')
+  })
+
+  it('flipping the mirror file opens and closes the endpoint immediately (no instance restart)', async () => {
+    const { fake, home } = await startInstance({ allowSelfService: false })
+    cleanups.push(async () => { await fake.dispose(); await rm(home, { recursive: true, force: true }) })
+    const headers = { cookie: fake.cookieHeader() }
+
+    const before = await fetch(`${fake.baseUrl}/dsh-login/models`, { headers })
+    assert.equal(before.status, 403)
+    assert.match(await before.text(), /管理员已关闭/)
+
+    // The hub's toggle writes exactly this file; the running instance re-reads
+    // it per request, so no restart or reload of the plugin is involved.
+    await writeModelPolicy(home, true)
+    const after = await fetch(`${fake.baseUrl}/dsh-login/models`, { headers })
+    assert.equal(after.status, 200)
+    const afterHtml = await after.text()
+    assert.match(afterHtml, /id="add-form"/)
+    assert.match(afterHtml, /data-preset="deepseek"/)
+
+    // …and revoking closes it again just as fast.
+    await writeModelPolicy(home, false)
+    const revoked = await fetch(`${fake.baseUrl}/dsh-login/models`, { headers })
+    assert.equal(revoked.status, 403)
+    assert.ok(!(await revoked.text()).includes('id="add-form"'))
   })
 })

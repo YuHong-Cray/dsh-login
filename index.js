@@ -57,8 +57,9 @@ import {
   summarizeModelConfig, validateModelConfig, validateMyModels,
 } from './lib/model-config.js'
 import { loginPage } from './lib/page.js'
+import { policyFromColumn, readModelPolicy, writeModelPolicy } from './lib/model-policy.js'
 import {
-  renderAccountPage, renderEnterConfirmPage, renderMyModelsPage,
+  renderAccountPage, renderEnterConfirmPage, renderModelsClosedPage, renderMyModelsPage,
   renderUserModelsPage, renderUsersPage,
 } from './lib/account-page.js'
 
@@ -79,6 +80,8 @@ const USERS_DELETE_PATH = '/dsh-login/users/delete'
 const USER_MODELS_PATH = '/dsh-login/users/models'
 /** Admin console: approve or reject one registered account. */
 const USERS_STATUS_PATH = '/dsh-login/users/status'
+/** Admin console: allow/deny one user configuring their own model providers. */
+const USERS_MODEL_POLICY_PATH = '/dsh-login/users/model-policy'
 const BODY_LIMIT = 64 * 1024
 const INNER_MAX_AGE_DAYS = 30
 const INNER_MAX_AGE_MS = INNER_MAX_AGE_DAYS * 24 * 60 * 60 * 1000
@@ -100,6 +103,8 @@ const ERRORS = {
   pendingApproval: '账号已注册，正在等待管理员审批；审批通过后即可登录',
   rejectedApproval: '账号未通过管理员审批，请联系管理员',
   registeredPending: '注册成功！请等待管理员审批，审批通过后即可登录',
+  /** Instance mode: the self-service model page is gated by the admin switch. */
+  modelPolicyDenied: '管理员尚未允许你自行设置模型参数：请联系管理员在「用户管理」中开启「允许自行设置模型」，或让管理员直接为你配置。',
   logoutRedirect: '/dsh-login/login',
 }
 
@@ -385,6 +390,7 @@ function createLazyDb(dbCfg) {
     findByUsername: (username) => load().then((d) => d.findByUsername(username)),
     listUsers: () => load().then((d) => d.listUsers()),
     setStatus: (username, status) => load().then((d) => d.setStatus(username, status)),
+    setModelSelfService: (username, allow) => load().then((d) => d.setModelSelfService(username, allow)),
     touchLastLogin: (username) => load().then((d) => d.touchLastLogin(username)),
     remove: (username) => load().then((d) => d.remove(username)),
     close() {
@@ -481,6 +487,32 @@ export function apply(ctx) {
     }
     managerInstance.setHub(hubPort(), deriveHubBase(cfg.instances.hubBase, hubPort()))
     return managerInstance
+  }
+
+  /**
+   * Ensure one user's instance is running, first mirroring the administrator's
+   * model-self-service decision into that user's DSH_HOME.
+   *
+   * The instance enforces the switch from its own local copy
+   * (lib/model-policy.js), so a freshly provisioned or restored home must be
+   * brought back in step with the account table before the instance starts.
+   * The lookup fails CLOSED: if the decision cannot be read, the mirror is
+   * rewritten to "denied" so a stale grant cannot outlive the database answer.
+   */
+  const ensureUserInstance = async (username) => {
+    let allow = false
+    try {
+      const row = await db.findByUsername(username)
+      allow = policyFromColumn(row?.model_self_service)
+    } catch (err) {
+      ctx.logger?.warn?.(err instanceof Error ? err : new Error(String(err)))
+    }
+    try {
+      await writeModelPolicy(manager().userDir(username), allow)
+    } catch (err) {
+      ctx.logger?.warn?.(err instanceof Error ? err : new Error(String(err)))
+    }
+    return manager().ensure(username)
   }
   // Adopt provisioned instances at boot (populates the port cache so the
   // synchronous gate can redirect to a known instance URL).
@@ -596,7 +628,7 @@ export function apply(ctx) {
    */
   const handoffRedirect = async (req, res, username, next) => {
     const hostNoPort = hostNoPortOf(req.headers.host) ?? '127.0.0.1'
-    const port = await manager().ensure(username)
+    const port = await ensureUserInstance(username)
     knownPorts.set(username, port)
     if (innerSecret === undefined) await ensureInnerSecret()
     if (innerSecret === undefined) {
@@ -868,7 +900,7 @@ export function apply(ctx) {
     }
     let port
     try {
-      port = await manager().ensure(target)
+      port = await ensureUserInstance(target)
     } catch (err) {
       const msg = `独立环境准备失败：${err instanceof Error ? err.message : String(err)}`
       ctx.logger?.warn?.(err instanceof Error ? err : new Error(msg))
@@ -1055,6 +1087,85 @@ export function apply(ctx) {
   }
 
   /**
+   * Administrator switch: may this user configure their own model providers?
+   *
+   * Two stores move together: the account table column (the durable source of
+   * truth shown by the console) and the mirror file in the user's DSH_HOME
+   * that their own instance reads on every self-service request. Turning it ON
+   * is the whole approval — there is no per-change queue; turning it OFF makes
+   * the user's 「我的模型」 page read-only immediately, without an instance
+   * restart.
+   */
+  const handleUserModelPolicy = async (req, res) => {
+    const token = parseCookies(req.headers.cookie)[COOKIE_NAME]
+    const row = token === undefined ? undefined : sessions.get(token)
+    const self = row?.user
+    if (self === undefined) {
+      json(res, 401, { error: '未登录' })
+      return
+    }
+    if (!isAdmin(self)) {
+      json(res, 403, { error: '仅管理员可以设置模型权限' })
+      return
+    }
+    if (!originMatchesHost(req.headers.origin, req.headers.host)) {
+      json(res, 403, { error: ERRORS.badOrigin })
+      return
+    }
+    let body
+    try {
+      body = await decodeBody(req)
+    } catch {
+      body = undefined
+    }
+    if (body === undefined) {
+      json(res, 400, { error: ERRORS.badBody })
+      return
+    }
+    const target = typeof body.user === 'string' ? body.user : ''
+    if (!isSafeUsername(target)) {
+      json(res, 400, { error: ERRORS.invalidUsername })
+      return
+    }
+    // Accept a real boolean or the form encodings (x-www-form-urlencoded
+    // decodes to strings); anything else is a malformed request.
+    const allow = body.allow === true || body.allow === 'true' || body.allow === 'on' || body.allow === 1 || body.allow === '1'
+    const deny = body.allow === false || body.allow === 'false' || body.allow === 'off' || body.allow === 0 || body.allow === '0'
+    if (!allow && !deny) {
+      json(res, 400, { error: 'allow 需为 true 或 false' })
+      return
+    }
+    if (isAdmin(target)) {
+      json(res, 400, { error: '管理员账号无需此开关（管理员直接在 hub 上管理自己的模型）' })
+      return
+    }
+    try {
+      if ((await db.findByUsername(target)) === undefined) {
+        json(res, 404, { error: '用户不存在' })
+        return
+      }
+      await db.setModelSelfService(target, allow)
+    } catch (err) {
+      json(res, 503, { error: `数据库暂不可用：${err instanceof Error ? err.message : String(err)}` })
+      return
+    }
+    // Mirror the decision for the user's own instance. A failure here is not
+    // fatal for the console (the DB row is authoritative and the next ensure
+    // re-mirrors it), but it must be visible: report it and let the admin
+    // retry rather than claiming success while the instance still denies.
+    try {
+      await writeModelPolicy(manager().userDir(target), allow)
+    } catch (err) {
+      json(res, 500, {
+        error: `权限已写入数据库，但同步到该用户环境失败（其登录时会自动重试）：${err instanceof Error ? err.message : String(err)}`,
+        allow,
+      })
+      return
+    }
+    json(res, 200, { ok: true, allow })
+  }
+
+  /**
    * Admin console: GET renders one user's model configuration plus the form;
    * POST writes it through that user's own instance API.
    */
@@ -1111,7 +1222,7 @@ export function apply(ctx) {
       const parsed = validateModelConfig(body)
       if (!parsed.ok) { fail(400, parsed.error, body); return }
       try {
-        const port = await manager().ensure(target)
+        const port = await ensureUserInstance(target)
         knownPorts.set(target, port)
         await applyModelConfig((method, args) => instanceRpc(port, method, args), parsed.value)
       } catch (err) {
@@ -1292,6 +1403,7 @@ export function apply(ctx) {
             username: r.username,
             admin: isAdmin(r.username),
             status: typeof r.status === 'string' ? r.status : 'approved',
+            modelSelfService: policyFromColumn(r.model_self_service),
             port: rec?.port ?? 0,
             running: rec?.running ?? false,
             createdAt: fmtTs(r.created_at),
@@ -1311,6 +1423,10 @@ export function apply(ctx) {
       }
       if (path === USERS_STATUS_PATH && req.method === 'POST') {
         await handleUserStatus(req, res)
+        return
+      }
+      if (path === USERS_MODEL_POLICY_PATH && req.method === 'POST') {
+        await handleUserModelPolicy(req, res)
         return
       }
       if (path === USER_MODELS_PATH && (req.method === 'GET' || req.method === 'POST')) {
@@ -1662,7 +1778,11 @@ function applyInstance(ctx, home, cfg) {
       return
     }
     if (path === ACCOUNT_PATH && req.method === 'GET') {
-      html(res, 200, renderAccountPage({ mode: 'instance', port: cfg.port }))
+      html(res, 200, renderAccountPage({
+        mode: 'instance',
+        port: cfg.port,
+        allowSelfService: await readModelPolicy(home),
+      }))
       return
     }
 
@@ -1670,8 +1790,18 @@ function applyInstance(ctx, home, cfg) {
     // Admission already required this instance's inner cookie (decide()), so
     // only the logged-in user (or an administrator acting as them, the
     // documented trust-model exception) reaches these handlers.
+    //
+    // The whole surface additionally honours the administrator's per-user
+    // switch, mirrored into this DSH_HOME by the hub (lib/model-policy.js):
+    // without an explicit grant the endpoint is CLOSED — GET answers a 403
+    // "closed by the administrator" page and every write/JSON route refuses.
+    // Missing mirror file = denied, so an upgraded instance grants nothing.
     if (path === myModelsPath && req.method === 'GET') {
       const url = new URL(req.url ?? '/', 'http://localhost')
+      if (!(await readModelPolicy(home))) {
+        html(res, 403, renderModelsClosedPage({ port: cfg.port }))
+        return
+      }
       const { providers, defaultModel, readError } = await readMyModels()
       html(res, 200, renderMyModelsPage({
         port: cfg.port,
@@ -1683,6 +1813,12 @@ function applyInstance(ctx, home, cfg) {
       return
     }
     if (path === myModelsPath && req.method === 'POST') {
+      // The switch is checked first: a closed endpoint must not validate,
+      // echo, or otherwise touch anything.
+      if (!(await readModelPolicy(home))) {
+        html(res, 403, renderModelsClosedPage({ port: cfg.port }))
+        return
+      }
       let body
       try {
         body = await decodeBody(req)
@@ -1773,6 +1909,7 @@ function applyInstance(ctx, home, cfg) {
       }
       if (body === undefined) { json(res, 400, { error: ERRORS.badBody }); return }
       if (!originMatchesHost(req.headers.origin, req.headers.host)) { json(res, 403, { error: ERRORS.badOrigin }); return }
+      if (!(await readModelPolicy(home))) { json(res, 403, { error: ERRORS.modelPolicyDenied }); return }
       const id = typeof body.id === 'string' ? body.id.trim() : ''
       if (!isProviderId(id)) { json(res, 400, { error: 'provider 标识不合法' }); return }
       const { providers } = await readMyModels()
@@ -1796,6 +1933,7 @@ function applyInstance(ctx, home, cfg) {
       }
       if (body === undefined) { json(res, 400, { error: ERRORS.badBody }); return }
       if (!originMatchesHost(req.headers.origin, req.headers.host)) { json(res, 403, { error: ERRORS.badOrigin }); return }
+      if (!(await readModelPolicy(home))) { json(res, 403, { error: ERRORS.modelPolicyDenied }); return }
       const provider = typeof body.provider === 'string' ? body.provider.trim() : ''
       const model = typeof body.model === 'string' ? body.model.trim() : ''
       if (!isProviderId(provider) || model === '' || model.length > 200) {
@@ -1821,6 +1959,7 @@ function applyInstance(ctx, home, cfg) {
       return
     }
     if (path === myModelsListOfPath && req.method === 'GET') {
+      if (!(await readModelPolicy(home))) { json(res, 403, { error: ERRORS.modelPolicyDenied }); return }
       const url = new URL(req.url ?? '/', 'http://localhost')
       const id = url.searchParams.get('id') ?? ''
       if (!isProviderId(id)) { json(res, 400, { error: 'provider 标识不合法' }); return }

@@ -472,6 +472,14 @@ export function apply(ctx) {
         hubBase: '',
         allowCidrs: cfg.allowCidrs,
         rejectProxyHeaders: cfg.rejectProxyHeaders,
+        // Per-tenant OS isolation: each instance runs as its own non-root
+        // account with the DSH_HOME handed to that uid, so even a
+        // danger-full-access session cannot read the hub's home, the checkout,
+        // or a neighbour's home.
+        isolation: cfg.instances.isolation,
+        osUserPrefix: cfg.instances.osUserPrefix,
+        maxOldSpaceMb: cfg.instances.maxOldSpaceMb,
+        nprocLimit: cfg.instances.nprocLimit,
         // Each instance shares exactly ONE credential with the hub: the
         // browser-session signing secret the handoff is minted with. Model
         // choices and provider API keys start empty for every user.

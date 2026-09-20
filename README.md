@@ -4,7 +4,7 @@
 
 - **hub**（操作员的 `dsh web`，本部署为 3080 端口）是唯一登录面：登录页支持**注册**与**登录**，注册把新账号写入 MySQL 账号表（本部署为 `dsh` 库的 `dsh_login` 表），登录先用数据库认证，**认证通过才能使用应用**；
 - **管理员**（配置 `adminUsers`）登录后直接进入 hub 应用（3080），行为与单用户门禁时代完全一致；
-- **普通用户**登录/注册成功后，hub 自动为其供给一个**独立的 dsh web 实例**：独立 `DSH_HOME`（`/root/dsh-users/<username>/`）、独立端口（3100 起）、独立会话/设置/工作区——**每个用户的工作区彼此隔离、互不影响**。
+- **普通用户**登录/注册成功后，hub 自动为其供给一个**独立的 dsh web 实例**：独立 `DSH_HOME`（`/srv/dsh-users/<username>/`）、独立端口（3100 起）、独立会话/设置/工作区，并运行在该用户**专属的非特权 OS 账号**下（见「多租户隔离」）——每个用户的工作区彼此隔离、互不影响。
 
 本插件是 `dsh web` 宿主侧插件（纯 Node.js，无构建步骤），以 bundle 形式挂入 web profile，替换了原 `dsh-lan-gate` 的固定密码门禁。同一份代码以两种模式运行（由 `$DSH_HOME/dsh-login.json` 决定）：
 
@@ -24,7 +24,7 @@
                                     │ 302 http://<host>:<userPort>/<next>?handoff=<v1 签名令牌>
                                     ▼
             用户实例: 独立 dsh web 进程（detached，独立进程组）
-                   DSH_HOME = /root/dsh-users/<username>/
+                   DSH_HOME = /srv/dsh-users/<username>/
                    dsh-login(instance 模式) 门禁：
                    ├─ handoff 有效且未兑换 → 铸造 30 天内置 cookie → 303 到去掉 handoff 的 URL
                    ├─ 有效内置 cookie → 放行给 DSH 内置 BrowserAuth（同密钥双重校验）
@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
   "requireApproval": true,
   "adminUsers": ["admin"],
   "instances": {
-    "root": "/root/dsh-users",
+    "root": "/srv/dsh-users",
     "portBase": 3100,
     "checkout": "/deepseek-harness",
     "hubBase": "http://192.168.0.50:3080/"
@@ -174,10 +174,14 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
 
 
 - `sessionTtlSec`：hub 会话有效期（秒），范围 60 ~ 31536000。
-- `instances.root`：用户实例 DSH_HOME 根目录（绝对路径，默认 `/root/dsh-users`）。
+- `instances.root`：用户实例 DSH_HOME 根目录（绝对路径，默认 `/srv/dsh-users`）。
 - `instances.portBase`：用户实例首个端口（默认 `3100`）。每个用户的端口写入 `<root>/<u>/instance.json` 持久化，**重启后端口稳定不变**（用户书签/已铸造 cookie 继续有效）。
-- `instances.checkout`：DSH 源码 checkout（用户实例直接以 tsx 运行其 TS 源码，默认 `/deepseek-harness`）。
+- `instances.checkout`：DSH checkout（用户实例**镜像 hub 自身的启动平面**：hub 跑 `apps/cli/lib/bin.js` 编译产物时实例也跑编译产物，hub 以 tsx 跑 `apps/cli/src/bin.ts` 源码时实例同样跑源码；默认 `/deepseek-harness`）。
 - `instances.hubBase`：hub 的规范地址（实例端回跳/退出时用它拼登录页 URL）；**省略时自动派生**为「本机第一个非回环 IPv4 + hub 监听端口」。
+- `instances.isolation`：`"uid"`（默认）让每个实例运行在**专属非特权 OS 账号**下，其 DSH_HOME 归该 uid 所有并设 0700；`"none"` 保留旧的 root 单租户模式（仅开发用）。`"uid"` 要求 hub 以 root 运行；实例根目录必须能被租户穿越（见「多租户隔离」）。
+- `instances.osUserPrefix`：租户账号名前缀（默认 `dsh-`，须是小写 Linux 账号前缀，≤ 16 字符）。
+- `instances.maxOldSpaceMb`：每个实例的 V8 堆上限（默认 `1536`，`0` = 不限）。
+- `instances.nprocLimit`：每个租户的进程数上限（默认 `512`，经 `prlimit --nproc`；`0` = 不限）。
 
 ### instance 模式（hub 在 provisioning 时自动写入每个用户 `DSH_HOME/dsh-login.json`，通常无需手工编辑）
 
@@ -196,7 +200,7 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
 用户**首次**登录/注册时自动执行（约 30s~2min，取决于 pnpm store 冷热）：
 
 ```
-/root/dsh-users/<username>/
+/srv/dsh-users/<username>/
   .credentials.yaml   ← 仅含 hub 的 browser-session 签名密钥（handoff 必需）0600
   settings.yaml       ← 模板：无 provider/密钥 + 隐藏内置 deepseek-official 目录
   dsh-login.json      ← 实例模式配置（hub 写入） 0600
@@ -206,22 +210,43 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
   sessions/ storages/ ← 运行期自动创建
 ```
 
-实例启动命令（由 hub 以 detached 方式发出，独立进程组）：
+实例启动命令（由 hub 以 detached 方式发出，独立进程组）**镜像 hub 自己的启动向量**（`lib/instances.js` 的 `instanceLaunchVector()`，取 `process.argv[1]`）：
 
 ```
+# hub 运行编译产物（apps/cli/lib/bin.js）时：
+node <checkout>/apps/cli/lib/bin.js web --no-open --port <P>
+
+# hub 以 tsx 运行源码（apps/cli/src/bin.ts）时：
 node --import <checkout>/node_modules/tsx/dist/esm/index.mjs \
       <checkout>/apps/cli/src/bin.ts web --no-open --port <P>
-  cwd = /root/dsh-users/<username>      # 新会话默认工作目录 = 用户目录（隔离关键）
-  env DSH_HOME = /root/dsh-users/<username>
   env TSX_TSCONFIG_PATH = <checkout>/tsconfig.json
+
+  cwd = /srv/dsh-users/<username>      # 新会话默认工作目录 = 用户目录（隔离关键）
+  env DSH_HOME = /srv/dsh-users/<username>
 ```
 
 - `cwd` 即会话控制器的 `defaultCwd`：用户新建的会话默认落在**自己的目录**，不会写到 DSH 源码树或其他用户目录；
-- `TSX_TSCONFIG_PATH` 必须注入：tsx 按「工作目录向上找 tsconfig」解析 workspace 路径映射（440 条 `paths`，把 `@deepseek-ai/*` 指向源码）；缺失时会加载 checkout 里陈旧的已编译 vendor 库而启动失败（症状：`web.log` 中 `does not provide an export named ...`）。
+- **实例必须与 hub 处于同一模块平面（重要，2026-09-20 修复）**：tsx 的 tsconfig `paths` 映射会把嵌套的 `@deepseek-ai/*` 导入指向 `src` 源码，而 profile 的包解析把 loader 入口加载为安装目录里的编译产物 `lib`。两者混用会加载**两份 `@deepseek-ai/dsh-tools`**：注册 `tools` 服务的那份来自 `lib/index.js`，agent loop 读取的模块私有符号 `TOOL_RUNTIME_SCHEDULER` 来自 `src/index.ts`，于是 `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 为 `undefined`，**每一次工具调用都让该轮以 `Cannot read properties of undefined (reading 'prepare')`（stop code `UNKNOWN`）失败**——症状就是普通用户会话里工具调用卡片出现后立刻「本轮运行失败」。hub 跑编译产物时实例也必须跑编译产物（此前硬编码 tsx+src，正是崩溃的来源）；
+- `TSX_TSCONFIG_PATH` 只在源码向量下注入：tsx 按「工作目录向上找 tsconfig」解析 workspace 路径映射（把 `@deepseek-ai/*` 指向源码）；缺失时会加载 checkout 里已编译的 vendor 库而启动失败（症状：`web.log` 中 `does not provide an export named ...`）。
 
 就绪判据：实例的 `/dsh-login/health` 返回 200（120s 超时，超时则该次登录返回 503，重试即可——provisioning 幂等）。health 同时返回 `identity`（其 `DSH_HOME` 的 sha256 前 16 位），hub 用它确认「这个端口上跑的确实是我为当前目录供给的实例」。
 
-**不要手工 `rm -rf /root/dsh-users/<u>` 删用户目录（重要）**：若其实例仍在运行，旧进程会继续占着端口、却服务一个已被删除的 home。症状是 GUI 里 `本轮运行失败 ENOENT: ... /sessions/<id>/session.v3.jsonl.zstd`（旧目录已删，它内存中的会话指向不存在的文件），而且新实例抢端口会 `EADDRINUSE` 崩溃。请改用「用户管理 → 删除」（`manager.remove()` 先 SIGTERM 再删目录）。
+### 多租户隔离（UID 降权，2026-09-20）
+
+`instances.isolation: "uid"` 时，provisioning 会在首次启动前、`ensure()` 在每次启动前确保：
+
+1. 派生并创建租户账号 `osUserFor(username)`：`useradd --system --no-create-home --shell /usr/sbin/nologin`，幂等；账号名是 `<prefix><可读前缀>-<sha256 前 6 位>`（ASCII、≤32 字符，中文用户名也能安全映射）；「用户管理 → 删除」会 `userdel`。
+2. 实例根目录可被穿越：`instances.root` 本身补 `o+x`（0711，能到达自己目录、不能列邻居）；**上层目录若是 0700（如 `/root`），直接抛错让该次登录 503 并说明要搬家**，绝不静默放开 `/root`。
+3. profile 固定 `packageImportMethod: copy`（写 `profiles/web/pnpm-workspace.yaml`，同时写 `.npmrc` 兼容旧版 pnpm）：pnpm 默认硬链接会把 store 的 inode 链进 `node_modules`，对它 `chown -R` 会连带改掉 store 内容的属主——而 hub 自己的 profile 也共享同一批 inode，实测会让租户“拥有” hub 的 `dsh-lan-access` 文件。chown 之前还会扫描 home，把任何 `nlink > 1` 的文件重写成私有副本（`breakSharedHardlinks()`），作为最后一道保险（pnpm 12 会忽略 `.npmrc` 里的该键，只有 `pnpm-workspace.yaml` 生效）。
+4. `chown -R -h -P <uid>:<gid> <home>`（`-h` 确保 profile 里指向 checkout 的符号链接不被解引用），并把 home 设 0700。
+5. 启动时 `spawn(..., { uid, gid })` 降权；`HOME`/`USER`/`LOGNAME` 指向租户自己（旧实现会继承 hub 的 `HOME=/root`），并施加 `--max-old-space-size` 与 `prlimit --nproc` 限额。
+
+**从 root 模式升级**：home 属主仍是 root 时，下一次 `ensure()` 会打印 `migrating <user>'s home to <osUser>`，先停掉 `instance.json` 记录的进程（用 `/proc/<pid>/cmdline` 校验 pid 未被回收才发信号）、按 copy 方式重装 profile 依赖、再 chown。**布局前提**：`/root` 是 0700，租户够不到 `/root/dsh-users/**`，因此实例根目录必须在 `/root` 之外（默认 `/srv/dsh-users`）：把 `instances.root` 改到新路径，并 `mv` 旧目录。
+
+**挡得住**：另一个租户（或该租户自己）在 `danger-full-access` 会话里读 hub 的 `/root/.dsh`（含管理员 `DEEPSEEK_API_KEY` 与 `dsh-login.json` 里的数据库口令）、读写 `/stp-harness` 检出、读写邻居的 home/会话。
+**挡不住**：租户对自己的 `settings.yaml`/`.credentials.yaml`/实例 `/api` 仍有完全控制（那是他自己的东西）；网络不做限制（仍可访问内网/数据库端口，但已拿不到 hub 里的数据库口令与管理员 key）；hub 仍是 root，请保持 `instances.root`、checkout、hub home 的属主与权限不变。
+
+**不要手工 `rm -rf /srv/dsh-users/<u>` 删用户目录（重要）**：若其实例仍在运行，旧进程会继续占着端口、却服务一个已被删除的 home。症状是 GUI 里 `本轮运行失败 ENOENT: ... /sessions/<id>/session.v3.jsonl.zstd`（旧目录已删，它内存中的会话指向不存在的文件），而且新实例抢端口会 `EADDRINUSE` 崩溃。请改用「用户管理 → 删除」（`manager.remove()` 先 SIGTERM 再删目录）。
 
 hub 侧另有两道防护（`lib/instances.js`）：`allocatePort()` 分配端口时**跳过真正在监听的端口**（避免 EADDRINUSE，并让该用户自动落到下一个空闲端口）；`probeHealth()` 校验 `identity`，若记录端口上的实例不是本用户当前 home（陈旧僵尸进程）则**自动换端口** spawn，而不是复用它。
 
@@ -308,16 +333,16 @@ DSH 有意**只允许 loopback 页面编辑 host 的 settings/credentials**（`p
 
 ```bash
 # 列出所有用户实例及端口/PID
-cat /root/dsh-users/*/instance.json
+cat /srv/dsh-users/*/instance.json
 
 # 查看某用户实例日志
-tail -f /root/dsh-users/<username>/web.log
+tail -f /srv/dsh-users/<username>/web.log
 
 # 手动停止某用户实例（其下次登录时 hub 会自动拉起）
-kill "$(node -pe 'require("/root/dsh-users/<username>/instance.json").pid')"
+kill "$(node -pe 'require("/srv/dsh-users/<username>/instance.json").pid')"
 
 # 彻底删除某用户（先停实例，再删目录与 DB 行）
-rm -rf /root/dsh-users/<username>
+rm -rf /srv/dsh-users/<username>
 # 然后删除 dsh_login 表中对应用户行
 ```
 
@@ -327,7 +352,7 @@ rm -rf /root/dsh-users/<username>
 
 1. 修改插件源码后**无需构建**（纯 ESM JS），也无需重新 `pnpm install`（符号链接即时生效），只需重启 `dsh web` 使插件代码生效；
 2. `dsh-login.json` 配置在每次启动时读取，改完同样需要重启；
-3. **注意**：用户实例里的插件是 provisioning 时的拷贝（pnpm `file:` 依赖）。hub 侧升级插件后，已存在的用户实例继续跑旧版本，直到该用户重新 provisioning（删除其 `/root/dsh-users/<u>` 目录后重新登录）或在其 `profiles/web` 目录手工重跑 `pnpm install`。provisioning 每次都从 `$DSH_HOME/profiles/web/vendor/dsh-login` **重新拷贝当前源码**，因此「删目录 + 重新登录」即可让该用户拿到最新门禁（含 WebSocket `head` 透传修复）；hub 自身无需重启即可让后续 provisioning 生效；
+3. **注意**：用户实例里的插件是 provisioning 时的拷贝（pnpm `file:` 依赖）。hub 侧升级插件后，已存在的用户实例继续跑旧版本，直到该用户重新 provisioning（删除其 `/srv/dsh-users/<u>` 目录后重新登录）或在其 `profiles/web` 目录手工重跑 `pnpm install`。provisioning 每次都从 `$DSH_HOME/profiles/web/vendor/dsh-login` **重新拷贝当前源码**，因此「删目录 + 重新登录」即可让该用户拿到最新门禁（含 WebSocket `head` 透传修复）；hub 自身无需重启即可让后续 provisioning 生效；
 4. 测试：`node --test test/gate.test.mjs`（会连接真实数据库，测试账号用后即删）；`node --test test/my-models.test.mjs`（用户自助模型页，纯假宿主、**不需要数据库**）。
 
 ## 安全说明
@@ -342,9 +367,9 @@ rm -rf /root/dsh-users/<username>
 - handoff 出现在 URL 查询参数中，暴露面与 DSH 自带的启动令牌（`?token=`）相当；以短时效 + 一次性 + `Referrer-Policy: no-referrer` 缓解；
 - 用户实例的内置 cookie 绑定自己的 authority（`Host:port`），跨实例、跨 hub 重放均会被拒绝（签名受众校验）；
 - **管理员操作面**（`/dsh-login/users`、`/dsh-login/users/status`、`/dsh-login/users/model-policy`、`/dsh-login/enter`、`/dsh-login/users/delete`）三重门槛：有效 hub 会话 + 该会话属于 `adminUsers` +（POST）同源 Origin 校验；删除操作另禁止删除自己。`enter` 的 POST **不写任何 hub 会话 cookie**，因此管理员"以某用户身份进入"不会顶掉自己的 hub 身份；
-- **信任模型说明**：hub 与所有用户实例共享同一 browser-session 签名密钥（provisioning 时以 `renderInstanceCredentials` 单独写入这一条记录），这是 hub 能铸造 handoff 的前提；除此之外用户实例不持有 hub 的任何凭据。该密钥等价于「对本机 GUI 的完全访问权」；本部署所有进程同机同用户运行，信任边界即主机本身。
+- **信任模型说明**：hub 与所有用户实例共享同一 browser-session 签名密钥（provisioning 时以 `renderInstanceCredentials` 单独写入这一条记录），这是 hub 能铸造 handoff 的前提；除此之外用户实例不持有 hub 的任何凭据。该密钥等价于「对本机 GUI 的完全访问权」；启用 `instances.isolation: "uid"`（默认）后租户实例以各自的非特权 uid 运行（hub 仍是 root，租户之间互不相通），因此它不再等于「主机上的完全访问权」——租户只能触碰自己的 home（见「多租户隔离」）。
 - **我的模型（用户自助页）**：不引入新权限——持有本实例内置 cookie 者本就能直接调该实例的 `/api`（门禁对 `/api` 一视同仁放行），页面只是把这些调用收进同一 Origin、同一 cookie 的受控表单：所有 POST 均有 Origin 同源校验；API key 只在表单提交时经回环传给本实例自己的 `/api`，页面任何渲染/回显都**不包含** key（失败回显仅保留除 key 外的字段）；预设表的 baseURL/模型 ID 是静态数据（来自 `lib/provider-presets.js`，与 pi-ai 目录核对一致），用户可自定义 baseURL 的能力类与管理员代管页、loopback 原生页完全相同（既有信任边界不变）。
-- **模型自设开关**：它是**逐人的管理策略**，由实例侧在整条 `/dsh-login/models*` 路径上服务端强制（未批准时 GET 返回 403「已关闭」页、所有写路由与 `models-of` 一律 403，不只是隐藏按钮），镜像文件缺失/损坏按禁止处理（fail closed）。需要明确的边界是：它约束的是本插件的自助接口，而不是一个针对实例所有者的硬沙箱——用户实例以 root 运行、其所有者本就能触碰同一份 `settings.yaml`/`.credentials.yaml` 与实例自身的 `/api`（见上一条的既有信任模型）。对普通用户「不许改模型」的强保证需要在操作系统/DSH 核心层面做隔离，不属于本插件的范围。
+- **模型自设开关**：它是**逐人的管理策略**，由实例侧在整条 `/dsh-login/models*` 路径上服务端强制（未批准时 GET 返回 403「已关闭」页、所有写路由与 `models-of` 一律 403，不只是隐藏按钮），镜像文件缺失/损坏按禁止处理（fail closed）。需要明确的边界是：它约束的是本插件的自助接口，而不是一个针对实例所有者的硬沙箱——实例以**该用户自己的非特权 uid** 运行（隔离只隔开租户之间与 hub，不隔开用户与自己的 home），其所有者本就能触碰同一份 `settings.yaml`/`.credentials.yaml` 与实例自身的 `/api`（见上一条的既有信任模型）。对普通用户「不许改模型」的强保证需要在操作系统/DSH 核心层面做隔离，不属于本插件的范围。
 
 ## 已知边界
 
@@ -352,11 +377,11 @@ rm -rf /root/dsh-users/<username>
 - 每个「浏览器 × 主机名」组合各自登录一次（cookie 按 Host 域隔离，浏览器标准行为）。
 - 内置桥接 cookie 寿命 30 天（DSH 内置门禁默认值）；到期前本插件会话（7 天）已先失效，用户重新登录即自动续上。
 - **每个用户实例是一个独立 node 进程**（常驻数百 MB 内存），适合中小规模用户数（单机几十人以内）；用户数多时再考虑改回单进程多租户。
-- 管理员与普通用户**不能互相访问对方的工作区/会话**：管理员只有 hub（3080）上的内容，普通用户只有自己实例上的内容；hub 上的历史会话（如 `/root/test` 下的会话）仅管理员可见。
+- 管理员与普通用户**不能互相访问对方的工作区/会话**：管理员只有 hub（3080）上的内容，普通用户只有自己实例上的内容；hub 上的历史会话（如 `/root/test` 下的会话）仅管理员可见。启用 `instances.isolation: "uid"`（默认）后这条由 OS 权限强制：各租户 home 属主不同且 0700，hub 的 `/root` 与 `/root/.dsh` 仍 0700 root。
 - 退出登录 = **完全退出**（两处已打通）：实例侧 `/dsh-login/logout` 清本实例内置 cookie 后**链到 hub 的 logout**，hub 侧 `/dsh-login/logout` 清 hub 会话并**同时清掉该 host 上各实例的内置 cookie**（最多 60 个），因此不会再出现"从实例退出登录后 hub 登录页仍显示已登录"。若浏览器仍留着某个实例 cookie（例如该实例已删除），它在到期前仍能访问那个实例——手动清该站点 cookie 即可。
 - 注册自动登录时 `last_login_at` 保持 NULL（只有显式登录才更新该列），属既有行为。
 - 用户实例端口稳定不变（`instance.json` 持久化）；若端口被其他长期占用，实例就绪探测会失败并在下次登录时报 503，处理掉占用或调高 `instances.portBase` 后重新 provisioning 即可。
-- 用户实例依赖 `instances.checkout` 的 DSH 源码（tsx 直跑 TS）。checkout 更新不影响运行中实例；新启动的实例使用新代码。
+- 用户实例镜像 `instances.checkout` 上 hub 的启动平面：hub 跑编译产物时，实例也跑 `apps/cli/lib/*`（checkout 的源码改动需要重新构建后**新启动**的实例才会生效）；hub 以 tsx 跑源码时实例跑源码。checkout 更新不影响运行中实例。
 - 「我的模型」自助页是实例侧新增路由：升级插件后**已存在的用户实例**仍跑旧版插件（见「安装 / 升级」第 3 条），该用户重新 provisioning（删目录 + 重新登录）或在其 `profiles/web` 重跑 `pnpm install` 后才有此页（同理，模型自设开关也只有在实例跑新版插件后才会被强制）；升级前添加的 provider 数据不受影响（都在该用户的 `settings.yaml` 里）。升级后所有用户**默认禁止**自行设置模型，需管理员在「用户管理」里显式批准。
 - 右下角「账户」悬浮按钮经 `webserver/index-inject` 注入；若未来 DSH webserver 移除/改名该注入事件，按钮不再出现，但所有 `/dsh-login/*` 页面仍可手动访问，功能不受影响。
 - 「以该用户身份进入」是**管理员特权**（等同以该用户身份操作其环境）；仅建议在排障/代管时使用。被进入用户无法从环境中区分访问者是其本人还是管理员（同机同密钥的既有信任模型使然）。

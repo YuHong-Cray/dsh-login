@@ -52,9 +52,15 @@ import {
   verifyInnerCookie,
 } from './lib/inner.js'
 import { deriveHubBase, InstanceManager, isSafeUsername, lanIp } from './lib/instances.js'
-import { applyModelConfig, summarizeModelConfig, validateModelConfig } from './lib/model-config.js'
+import {
+  applyModelConfig, applyMyModelDelete, applyMyModels, isProviderId, setDefaultOps,
+  summarizeModelConfig, validateModelConfig, validateMyModels,
+} from './lib/model-config.js'
 import { loginPage } from './lib/page.js'
-import { renderAccountPage, renderEnterConfirmPage, renderUserModelsPage, renderUsersPage } from './lib/account-page.js'
+import {
+  renderAccountPage, renderEnterConfirmPage, renderMyModelsPage,
+  renderUserModelsPage, renderUsersPage,
+} from './lib/account-page.js'
 
 export const name = 'dsh-login'
 export const inject = ['webServer', 'credentials']
@@ -1175,7 +1181,9 @@ export function apply(ctx) {
         }
         json(res, 200, {
           authenticated: row !== undefined,
-          ...(user === undefined ? {} : { username: user }),
+          // `admin` is what the browser half reads to decide whether to
+          // contribute the right-Sidebar user-management entry.
+          ...(user === undefined ? {} : { username: user, admin: isAdmin(user) }),
           db: await db.health(),
           register: cfg.register,
           ...(instanceInfo === undefined ? {} : { instance: instanceInfo }),
@@ -1362,15 +1370,92 @@ function applyInstance(ctx, home, cfg) {
   const instanceHealthPath = '/dsh-login/health'
   const instanceStatePath = '/dsh-login/state'
   const instanceLogoutPath = '/dsh-login/logout'
+  /** User self-service: the models page and its JSON actions. */
+  const myModelsPath = '/dsh-login/models'
+  const myModelsDeletePath = '/dsh-login/models/delete'
+  const myModelsDefaultPath = '/dsh-login/models/default'
+  const myModelsListOfPath = '/dsh-login/models/models-of'
   let innerSecret = undefined
-  readInnerSecret(ctx.credentials)
+  const innerSecretReady = readInnerSecret(ctx.credentials)
     .then((secret) => {
       innerSecret = secret
       if (secret === undefined) {
         console.error('dsh-login: instance mode: no browser-session secret found; cannot validate requests')
       }
+      return secret
     })
-    .catch(() => {})
+    .catch(() => undefined)
+
+  /**
+   * One read/write against THIS instance's own /api, over loopback.
+   *
+   * The same mechanism the hub uses against user instances (instanceRpc),
+   * turned on itself: a minted inner cookie for the loopback authority plus
+   * the standard client-request envelope. The gate and the built-in
+   * BrowserAuth both accept it (same shared secret, same audience), so the
+   * self-service Models page goes through DSH's validated write API instead
+   * of touching the settings files directly.
+   * @param method - Typert Remote method (e.g. `settings/mutate`).
+   * @param args - plain-object argument map.
+   * @returns the successful result value.
+   * @throws when the token cannot be minted, HTTP fails, or the instance refuses.
+   */
+  const selfRpc = async (method, args) => {
+    if (innerSecret === undefined) await innerSecretReady
+    if (innerSecret === undefined) throw new Error('无法生成本实例访问令牌（签名密钥不可用）')
+    if (!cfg.port) throw new Error('实例端口未知（dsh-login.json 未写 port），无法写入本地设置')
+    const authority = `127.0.0.1:${String(cfg.port)}`
+    const minted = mintInnerCookie(innerSecret, authority, INNER_MAX_AGE_DAYS)
+    const res = await fetch(`http://${authority}/api/${method}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: `${minted.name}=${minted.value}`,
+      },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: `self-${String(Date.now())}`,
+        method,
+        payload: { args },
+      }),
+      signal: AbortSignal.timeout(20_000),
+    })
+    if (!res.ok) throw new Error(`本实例接口返回 HTTP ${String(res.status)}`)
+    const envelope = await res.json()
+    const result = envelope?.result
+    if (result?.ok !== true) throw new Error(result?.error?.message ?? '本实例拒绝了该操作')
+    return result.value
+  }
+
+  /**
+   * The models page's read half: the provider directory plus the current
+   * default selection, with each named credential reference's stored state.
+   * A describe failure degrades to a banner (readError) rather than a blank
+   * page: the add form stays usable.
+   * @returns `{providers, defaultModel, readError}` — providers enriched with
+   *   `keyConfigured` (boolean | undefined) for rows naming a reference.
+   */
+  const readMyModels = async () => {
+    try {
+      const describe = await selfRpc('settings/describe', {})
+      const { providers, defaultModel } = summarizeModelConfig(describe)
+      const named = providers.filter((p) => typeof p.apiKeyEnv === 'string' && p.apiKeyEnv !== '')
+      if (named.length > 0) {
+        const creds = await selfRpc('credentials/describe', { refs: named.map((p) => p.apiKeyEnv) })
+        for (const p of named) {
+          const info = creds?.[p.apiKeyEnv]
+          p.keyConfigured = info?.configured === true
+        }
+      }
+      return { providers, defaultModel, readError: undefined }
+    } catch (err) {
+      return {
+        providers: [],
+        defaultModel: undefined,
+        readError: `读取当前模型配置失败：${err instanceof Error ? err.message : String(err)}`,
+      }
+    }
+  }
 
   // Single-use registry for accepted handoff tokens (sha256 of the token).
   const consumed = new Map()
@@ -1578,6 +1663,179 @@ function applyInstance(ctx, home, cfg) {
     }
     if (path === ACCOUNT_PATH && req.method === 'GET') {
       html(res, 200, renderAccountPage({ mode: 'instance', port: cfg.port }))
+      return
+    }
+
+    // ---- user self-service: the models page (own instance, own cookie) ----
+    // Admission already required this instance's inner cookie (decide()), so
+    // only the logged-in user (or an administrator acting as them, the
+    // documented trust-model exception) reaches these handlers.
+    if (path === myModelsPath && req.method === 'GET') {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const { providers, defaultModel, readError } = await readMyModels()
+      html(res, 200, renderMyModelsPage({
+        port: cfg.port,
+        providers,
+        defaultModel,
+        ok: url.searchParams.get('ok'),
+        readError,
+      }))
+      return
+    }
+    if (path === myModelsPath && req.method === 'POST') {
+      let body
+      try {
+        body = await decodeBody(req)
+      } catch {
+        body = undefined
+      }
+      const echoForm = body === undefined ? {} : {
+        kind: body.kind,
+        presetId: body.presetId,
+        providerId: body.providerId,
+        displayName: body.displayName,
+        api: body.api,
+        baseURL: body.baseURL,
+        models: body.models,
+        setDefault: body.setDefault,
+        defaultModel: body.defaultModel,
+      }
+      // Validate BEFORE touching the settings: a refused request (bad body,
+      // cross-origin) must have no side effects at all.
+      if (body === undefined) {
+        html(res, 400, renderMyModelsPage({
+          port: cfg.port, providers: [], defaultModel: undefined,
+          error: ERRORS.badBody, form: echoForm,
+        }))
+        return
+      }
+      if (!originMatchesHost(req.headers.origin, req.headers.host)) {
+        html(res, 403, renderMyModelsPage({
+          port: cfg.port, providers: [], defaultModel: undefined,
+          error: ERRORS.badOrigin, form: echoForm,
+        }))
+        return
+      }
+      const { providers, defaultModel, readError } = await readMyModels()
+      const fail = (status, error) => {
+        html(res, status, renderMyModelsPage({
+          port: cfg.port, providers, defaultModel, readError, error, form: echoForm,
+        }))
+      }
+      // Overwrite semantics need the CURRENT profile at the target route: a
+      // blank key must keep an existing credential reference (the DSH-native
+      // derivation rule), which only the stored profile knows.
+      const pidCandidate = typeof body.presetId === 'string' && body.presetId !== ''
+        ? body.presetId
+        : typeof body.providerId === 'string' ? body.providerId : ''
+      const existing = pidCandidate === ''
+        ? undefined
+        : providers.find((p) => p.id === pidCandidate.trim())
+      const parsed = validateMyModels(body, existing)
+      if (!parsed.ok) { fail(400, parsed.error); return }
+      // Best effort: a preset's chosen default must sit in the installed
+      // catalog (the local read the plugin answers without a network call);
+      // a catalog-read failure never blocks an explicit user choice.
+      if (body.kind === 'preset' && parsed.value.setDefault !== undefined) {
+        try {
+          const models = await selfRpc('llm/discoverModels', {
+            settingsNs: 'llm-pi-ai',
+            request: { provider: parsed.value.providerId },
+          })
+          if (Array.isArray(models) && models.length > 0
+            && !models.some((m) => m?.id === parsed.value.setDefault.model)) {
+            fail(400, `默认模型 ${parsed.value.setDefault.model} 不在 ${parsed.value.providerId} 的模型目录内`)
+            return
+          }
+        } catch {
+          // keep the user's explicit choice
+        }
+      }
+      try {
+        await applyMyModels(selfRpc, parsed.value)
+      } catch (err) {
+        fail(503, `写入失败：${err instanceof Error ? err.message : String(err)}`)
+        return
+      }
+      res.writeHead(303, {
+        location: `${myModelsPath}?ok=${encodeURIComponent(`已保存 provider ${parsed.value.providerId}`)}`,
+        'cache-control': 'no-store',
+      })
+      res.end()
+      return
+    }
+    if (path === myModelsDeletePath && req.method === 'POST') {
+      let body
+      try {
+        body = await decodeBody(req)
+      } catch {
+        body = undefined
+      }
+      if (body === undefined) { json(res, 400, { error: ERRORS.badBody }); return }
+      if (!originMatchesHost(req.headers.origin, req.headers.host)) { json(res, 403, { error: ERRORS.badOrigin }); return }
+      const id = typeof body.id === 'string' ? body.id.trim() : ''
+      if (!isProviderId(id)) { json(res, 400, { error: 'provider 标识不合法' }); return }
+      const { providers } = await readMyModels()
+      const existing = providers.find((p) => p.id === id)
+      if (existing === undefined) { json(res, 200, { ok: true, removed: false }); return }
+      try {
+        await applyMyModelDelete(selfRpc, id, existing)
+      } catch (err) {
+        json(res, 503, { error: err instanceof Error ? err.message : String(err) })
+        return
+      }
+      json(res, 200, { ok: true, removed: true })
+      return
+    }
+    if (path === myModelsDefaultPath && req.method === 'POST') {
+      let body
+      try {
+        body = await decodeBody(req)
+      } catch {
+        body = undefined
+      }
+      if (body === undefined) { json(res, 400, { error: ERRORS.badBody }); return }
+      if (!originMatchesHost(req.headers.origin, req.headers.host)) { json(res, 403, { error: ERRORS.badOrigin }); return }
+      const provider = typeof body.provider === 'string' ? body.provider.trim() : ''
+      const model = typeof body.model === 'string' ? body.model.trim() : ''
+      if (!isProviderId(provider) || model === '' || model.length > 200) {
+        json(res, 400, { error: 'provider 或模型 ID 不合法' })
+        return
+      }
+      const { providers } = await readMyModels()
+      if (!providers.some((p) => p.id === provider)) {
+        json(res, 400, { error: `provider ${provider} 尚未配置：请先添加` })
+        return
+      }
+      try {
+        await selfRpc('settings/mutate', {
+          ns: 'agent-default-model',
+          ops: setDefaultOps(provider, model),
+          expectedRevision: undefined,
+        })
+      } catch (err) {
+        json(res, 503, { error: err instanceof Error ? err.message : String(err) })
+        return
+      }
+      json(res, 200, { ok: true })
+      return
+    }
+    if (path === myModelsListOfPath && req.method === 'GET') {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const id = url.searchParams.get('id') ?? ''
+      if (!isProviderId(id)) { json(res, 400, { error: 'provider 标识不合法' }); return }
+      try {
+        const models = await selfRpc('llm/discoverModels', {
+          settingsNs: 'llm-pi-ai',
+          request: { provider: id },
+        })
+        const list = (Array.isArray(models) ? models : [])
+          .filter((m) => typeof m?.id === 'string' && m.id !== '')
+          .map((m) => ({ id: m.id, ...(typeof m.name === 'string' && m.name !== '' ? { name: m.name } : {}) }))
+        json(res, 200, { ok: true, models: list })
+      } catch (err) {
+        json(res, 503, { ok: false, error: err instanceof Error ? err.message : String(err) })
+      }
       return
     }
     json(res, 404, { error: 'not found' })

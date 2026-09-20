@@ -81,12 +81,25 @@
 | `lib/auth.js` | scrypt 密码哈希、会话存储、限流、cookie 工具 |
 | `lib/inner.js` | 内置会话 cookie / handoff 令牌的铸造与校验（与 BrowserAuth 字节兼容） |
 | `lib/instances.js` | 用户实例生命周期：端口分配、provisioning（DSH_HOME/profile/pnpm install）、detached 启动、就绪探测、收养、删除 |
-| `lib/account-page.js` | 账户中心 / 用户管理 / 进入确认 三个服务端渲染页面（深色主题） |
+| `lib/account-page.js` | 账户中心 / 用户管理 / 进入确认 / 我的模型 四个服务端渲染页面（深色主题） |
+| `lib/model-config.js` | 模型配置校验与写入序列：管理员页与用户自助页共用（provider/模型/key 校验、`settings/mutate` + `credentials/set` 操作序列） |
+| `lib/provider-presets.js` | 内置提供方预设表（18 家，常用 8 家置顶；id/baseURL/默认模型均与 pi-ai 内置目录核对一致） |
 | `lib/cidr.js` | IPv4 CIDR / 回环地址判断 |
 | `lib/page.js` | 登录页（自包含 HTML/CSS/JS，深色主题，登录/注册双页签） |
+| `lib/client.js` | **浏览器半边**：管理员登录后在右侧边栏「开始」页贡献「用户管理」入口，点开即在侧边栏内嵌 `/dsh-login/users`。按 client module system 的 bundle 格式手写（本插件无构建步骤），角色取自 `/dsh-login/state` 的 `admin` 字段 |
 | `cordis.patch.yml` | bundle 补丁：向 profile 树插入插件行 |
 | `test/gate.test.mjs` | 集成测试（假宿主 + 真实 MySQL + 租户原语） |
+| `test/my-models.test.mjs` | 用户自助模型页测试（预设表/校验/写入序列/假宿主集成；**不需要 MySQL**） |
+| `test/client-half.test.mjs` | 浏览器半边测试（VM 内执行 bundle + 假 ctx/fetch：管理员注册入口、非管理员不注册；**不需要 MySQL**） |
 | `test/inner-real.spec.mjs` | 与运行中 dsh web 的字节兼容性验证（对已部署门禁的宿主自动跳过） |
+
+## 右侧边栏「用户管理」入口（浏览器半边）
+
+`package.json` 的 `dsh.client` 让 Web shell 把 `lib/client.js` 当作同源 classic script 载入。它只在**管理员**登录后向右侧边栏注册一个页面类型「用户管理」：展开右侧边栏的「开始」页会多出一张入口卡片，点开就用 iframe 内嵌 `/dsh-login/users`（同源，页面未设 `X-Frame-Options`）。非管理员启动时 `apply` 读 `/dsh-login/state` 得到 `admin !== true`，于是什么都不注册，右侧边栏看不到该入口。
+
+- 该半边**手写**为 client module system 的 bundle 格式（`window.__ModuleLoader__.load({ id, factory })`），因为本插件没有构建步骤；factory 的 `require` 只用到 shell 预置的 React 基线，其余能力全部经注入的 Cordis 服务（`slots` / `sidebarRightTabs` / `locale`）取得；
+- 改动宿主半边或 `package.json` 的 `dsh.client` 之后**必须重启 `dsh web`**：client module registry 会把「这个包不是 client 包」的判定缓存到进程重启，然后浏览器刷新即可看到入口；
+- 验证：`node --test test/client-half.test.mjs`（在 VM 里执行真实 bundle，配假 ctx/fetch）。部署侧端到端核对的临时脚本见 `/root/dsh-login-restore/verify-client-half.sh`。
 
 ## 账号表
 
@@ -221,7 +234,7 @@ WebSocket 服务端会**先写出 `101` 响应**，随后从 `head` 排空「握
 | `/dsh-login/login` | POST | 登录（JSON 或表单：`username`、`password`、`next`） |
 | `/dsh-login/register` | POST | 注册（`username`、`password`、`password2`），成功后自动登录（普通用户直接进入其实例） |
 | `/dsh-login/logout` | GET/POST | 退出 hub 会话 |
-| `/dsh-login/state` | GET | `{authenticated, username?, db: "up"|"down", register, instance?: {port, running}}` |
+| `/dsh-login/state` | GET | `{authenticated, username?, admin?, db: "up"|"down", register, instance?: {port, running}}`（`admin` 供浏览器半边判定是否贡献右侧边栏入口） |
 | `/dsh-login/health` | GET | `{ok: true, db: "up"|"down"}` |
 | `/dsh-login/account` | GET | **账户中心**：当前登录身份与角色、（普通用户）自己的实例地址/状态、退出登录、（管理员）用户管理入口。未登录 302 到登录页 |
 | `/dsh-login/users` | GET | **用户管理**（仅管理员）：全部账号（创建/最近登录时间）+ 实例（端口/运行状态）+ 操作：以该用户进入、打开、删除 |
@@ -235,11 +248,18 @@ WebSocket 服务端会**先写出 `101` 响应**，随后从 `head` 排空「握
 
 DSH 有意**只允许 loopback 页面编辑 host 的 settings/credentials**（`packages/client/connection/src/client/index.ts` 的 `isLoopback` 只看页面主机名；`packages/client/ui-settings/README.md`：*"Non-loopback pages get no durable settings … a scope starts `unavailable`"*）。因此经 LAN 域名（如 `192.168.0.50`）访问时，用户自己的「设置 → 模型」页必然报 *加载提供方目录失败: settings are unavailable in this browser*。服务器侧 API 本身可写（实测 LAN 下 `settings/describe` 返回 `writable: true`），被拦的只是浏览器端策略。
 
-本页因此让**管理员替用户写入同一套受校验的写入接口**：
+两条写入通道，走的是**同一套**校验与写入序列（`lib/model-config.js`）：
 
-- hub 用共享签名密钥为该用户实例铸造一张 inner cookie（authority = `127.0.0.1:<实例端口>`），然后调用**该用户实例自己**的 `/api`：`settings/mutate`（`llm-pi-ai.providers.<id>`，可选 `agent-default-model`）与 `credentials/set`（`<ID>_API_KEY`）；
-- 只写该用户 `DSH_HOME` 下的文件，绝不改 hub 或他人配置；实例在线时 settings 服务热加载，模型目录立即生效（无需重启实例）；
-- 参数校验：provider 标识 `^[a-z][a-z0-9-]{1,31}$`、`baseURL` 必须 http(s)、模型 ID 非空、API key 不得含换行/控制字符。实例未运行时保存会先 `ensure()`（首次供给约 30 秒~2 分钟）。
+1. **用户自助**（用户实例侧 `/dsh-login/models`，见上表）：用户登录后在**自己的实例**页面上添加提供方——贴入模型公司官网签发的 API key（18 家内置预设一键添加，或自定义 provider），即可删除、设默认模型。插件经回环调用本实例自己的 `/api`（`selfRpc`，与 hub 的 `instanceRpc` 同一机制）。
+2. **管理员代管**（hub 侧本页）：管理员替用户写入同一套受校验的写入接口：
+   - hub 用共享签名密钥为该用户实例铸造一张 inner cookie（authority = `127.0.0.1:<实例端口>`），然后调用**该用户实例自己**的 `/api`：`settings/mutate`（`llm-pi-ai.providers.<id>`，可选 `agent-default-model`）与 `credentials/set`（`<ID>_API_KEY`）；
+   - 实例未运行时保存会先 `ensure()`（首次供给约 30 秒~2 分钟）。
+
+两条通道共同的约束：
+
+- 只写目标用户 `DSH_HOME` 下的文件，绝不改 hub 或他人配置；实例在线时 settings 服务热加载，模型目录立即生效（无需重启实例）；
+- 参数校验：provider 标识 `^[a-z][a-z0-9-]{1,31}$`、`baseURL` 必须 http(s)、模型 ID 非空、API key 须为可打印 ASCII（去首尾空白后）且不得是引号包裹/整行环境变量/超长；
+- 写入顺序与 DSH 原生页一致：profile → key → 默认模型；删除时先 unset 凭据再 unset profile。
 
 > 补充：若浏览器与实例同机，可直接用 `http://127.0.0.1:<端口>`（loopback）访问，此时 DSH 原生设置页本身可用。
 
@@ -249,7 +269,12 @@ DSH 有意**只允许 loopback 页面编辑 host 的 settings/credentials**（`p
 | --- | --- | --- |
 | `/dsh-login/health` | GET | `{ok: true, instance: true}`（hub 探活用） |
 | `/dsh-login/state` | GET | `{authenticated, instance: true}` |
-| `/dsh-login/account` | GET | **账户中心（实例侧）**：当前环境端口 + 退出登录（完全退出）。需内置 cookie |
+| `/dsh-login/account` | GET | **账户中心（实例侧）**：当前环境端口 + 「我的模型」入口 + 退出登录（完全退出）。需内置 cookie |
+| `/dsh-login/models` | GET | **我的模型（用户自助）**：当前 provider 列表（含 API key 状态/默认标记）+ 默认模型 + 添加表单（内置预设 / 自定义）。需内置 cookie，未登录 302 回 hub 登录页 |
+| `/dsh-login/models` | POST | 保存新增/更新的 provider（表单或 JSON：`kind`、`presetId`/`providerId`、`displayName`、`api`、`baseURL`、`models`、`apiKey`、`setDefault`、`defaultModel`）。**只写本实例**的 `settings.yaml` + `.credentials.yaml`（经本实例自己的 `/api`）。Origin 校验；失败 400 回显表单（**不回显 key**）；成功 303 回本页 |
+| `/dsh-login/models/delete` | POST | 删除 provider：`{id}`。先 `credentials/unset` 约定 ref（`<ID>_API_KEY`）再 unset profile（与 DSH 原生页同序）；不存在的 id 返回 `{ok:true, removed:false}`。Origin 校验 |
+| `/dsh-login/models/default` | POST | 设默认模型：`{provider, model}`。写 `agent-default-model` 并 unset 残留的 `reasoningEffort`（沿用值会打断会话）。provider 须已配置。Origin 校验 |
+| `/dsh-login/models/models-of` | GET | `?id=<provider>`：返回该 provider 的模型列表（内置预设走 pi-ai 本地目录，无网络调用；自定义/未知路由 503）。供页面填充默认模型下拉框 |
 | `/dsh-login/logout` | GET/POST | 清除本实例内置 cookie，并**链到 hub 的 logout**（连同 hub 会话一起退出） |
 
 ### GUI 内的入口（悬浮按钮）
@@ -257,7 +282,7 @@ DSH 有意**只允许 loopback 页面编辑 host 的 settings/credentials**（`p
 插件通过 DSH webserver 官方的 `webserver/index-inject` 注入机制，在**每个** `dsh web` 的 GUI 页面右下角注入一个「账户」悬浮按钮（hub 与用户实例都有）：
 
 - hub（3080，管理员）：点「账户」→ 账户中心 → 「用户管理」；
-- 用户实例（3100+）：点「账户」→ 实例账户中心（端口 + 退出登录）。
+- 用户实例（3100+）：点「账户」→ 实例账户中心（端口 + **我的模型** + 退出登录）。
 
 按钮是静态注入（server 渲染进 index.html），页面内容按会话在**服务端**自适应，不需要额外 JS。
 
@@ -287,7 +312,7 @@ rm -rf /root/dsh-users/<username>
 1. 修改插件源码后**无需构建**（纯 ESM JS），也无需重新 `pnpm install`（符号链接即时生效），只需重启 `dsh web` 使插件代码生效；
 2. `dsh-login.json` 配置在每次启动时读取，改完同样需要重启；
 3. **注意**：用户实例里的插件是 provisioning 时的拷贝（pnpm `file:` 依赖）。hub 侧升级插件后，已存在的用户实例继续跑旧版本，直到该用户重新 provisioning（删除其 `/root/dsh-users/<u>` 目录后重新登录）或在其 `profiles/web` 目录手工重跑 `pnpm install`。provisioning 每次都从 `$DSH_HOME/profiles/web/vendor/dsh-login` **重新拷贝当前源码**，因此「删目录 + 重新登录」即可让该用户拿到最新门禁（含 WebSocket `head` 透传修复）；hub 自身无需重启即可让后续 provisioning 生效；
-4. 测试：`node --test test/gate.test.mjs`（会连接真实数据库，测试账号用后即删）。
+4. 测试：`node --test test/gate.test.mjs`（会连接真实数据库，测试账号用后即删）；`node --test test/my-models.test.mjs`（用户自助模型页，纯假宿主、**不需要数据库**）。
 
 ## 安全说明
 
@@ -302,6 +327,7 @@ rm -rf /root/dsh-users/<username>
 - 用户实例的内置 cookie 绑定自己的 authority（`Host:port`），跨实例、跨 hub 重放均会被拒绝（签名受众校验）；
 - **管理员操作面**（`/dsh-login/users`、`/dsh-login/enter`、`/dsh-login/users/delete`）三重门槛：有效 hub 会话 + 该会话属于 `adminUsers` +（POST）同源 Origin 校验；删除操作另禁止删除自己。`enter` 的 POST **不写任何 hub 会话 cookie**，因此管理员"以某用户身份进入"不会顶掉自己的 hub 身份；
 - **信任模型说明**：hub 与所有用户实例共享同一 browser-session 签名密钥（provisioning 时以 `renderInstanceCredentials` 单独写入这一条记录），这是 hub 能铸造 handoff 的前提；除此之外用户实例不持有 hub 的任何凭据。该密钥等价于「对本机 GUI 的完全访问权」；本部署所有进程同机同用户运行，信任边界即主机本身。
+- **我的模型（用户自助页）**：不引入新权限——持有本实例内置 cookie 者本就能直接调该实例的 `/api`（门禁对 `/api` 一视同仁放行），页面只是把这些调用收进同一 Origin、同一 cookie 的受控表单：所有 POST 均有 Origin 同源校验；API key 只在表单提交时经回环传给本实例自己的 `/api`，页面任何渲染/回显都**不包含** key（失败回显仅保留除 key 外的字段）；预设表的 baseURL/模型 ID 是静态数据（来自 `lib/provider-presets.js`，与 pi-ai 目录核对一致），用户可自定义 baseURL 的能力类与管理员代管页、loopback 原生页完全相同（既有信任边界不变）。
 
 ## 已知边界
 
@@ -314,5 +340,6 @@ rm -rf /root/dsh-users/<username>
 - 注册自动登录时 `last_login_at` 保持 NULL（只有显式登录才更新该列），属既有行为。
 - 用户实例端口稳定不变（`instance.json` 持久化）；若端口被其他长期占用，实例就绪探测会失败并在下次登录时报 503，处理掉占用或调高 `instances.portBase` 后重新 provisioning 即可。
 - 用户实例依赖 `instances.checkout` 的 DSH 源码（tsx 直跑 TS）。checkout 更新不影响运行中实例；新启动的实例使用新代码。
+- 「我的模型」自助页是实例侧新增路由：升级插件后**已存在的用户实例**仍跑旧版插件（见「安装 / 升级」第 3 条），该用户重新 provisioning（删目录 + 重新登录）或在其 `profiles/web` 重跑 `pnpm install` 后才有此页；升级前添加的 provider 数据不受影响（都在该用户的 `settings.yaml` 里）。
 - 右下角「账户」悬浮按钮经 `webserver/index-inject` 注入；若未来 DSH webserver 移除/改名该注入事件，按钮不再出现，但所有 `/dsh-login/*` 页面仍可手动访问，功能不受影响。
 - 「以该用户身份进入」是**管理员特权**（等同以该用户身份操作其环境）；仅建议在排障/代管时使用。被进入用户无法从环境中区分访问者是其本人还是管理员（同机同密钥的既有信任模型使然）。

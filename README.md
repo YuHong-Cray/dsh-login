@@ -29,13 +29,13 @@
                    ├─ handoff 有效且未兑换 → 铸造 30 天内置 cookie → 303 到去掉 handoff 的 URL
                    ├─ 有效内置 cookie → 放行给 DSH 内置 BrowserAuth（同密钥双重校验）
                    └─ 无 cookie → 302 回 hub 登录页（next=当前实例绝对 URL）/ /api、WS → 401
-                   独立 sessions/ · settings.yaml · 工作区（默认目录=用户目录）
+                   独立 sessions/ · profiles/web/cordis.patch.yml · 工作区（默认目录=用户目录）
 ```
 
 关键机制：
 
 - **handoff 令牌**与 DSH 内置会话 cookie 同一 `v1.<body>.<hmac>` 签名格式，签名密钥是 `.credentials.yaml` 里的 browser-session secret。hub 供给用户实例时**只写入这一条记录**（`renderInstanceCredentials`），因此 hub 能用自己已缓存的密钥为该实例铸造合法 handoff，而实例不再继承 hub 的任何 API key；
-- **每个用户实例的配置完全独立**：`settings.yaml` 以 `INSTANCE_SETTINGS_TEMPLATE` 起步——不含任何 provider/密钥，并写入 `llm-deepseek: { models: [] }` 以**隐藏 DSH 自带的 `deepseek-official` 目录**（该目录随 `@deepseek-ai/dsh-base` 提供、与管理员配置无关，且没有 `DEEPSEEK_API_KEY` 时不可用）。模型 / provider / API key 由管理员在「用户管理 → 模型」授予，或用户在本实例的「我的模型」里自行添加；**普通用户能否自行添加 / 更改模型参数由管理员在「用户管理」里逐人开关，默认禁止**（见「模型自设审批」一节）；
+- **每个用户实例的配置完全独立**：`settings.yaml` 以 `INSTANCE_SETTINGS_TEMPLATE` 起步——不含任何 provider/密钥，并写入 `llm-deepseek: { models: [] }` 以**隐藏 DSH 自带的 `deepseek-official` 目录**（该目录随 `@deepseek-ai/dsh-base` 提供、与管理员配置无关，且没有 `DEEPSEEK_API_KEY` 时不可用）。该模板在实例**首次启动时就被 DSH 核心一次性导入 profile**，真正的模型配置此后住在 `profiles/web/cordis.patch.yml`（见「模型配置落盘位置」一节）。模型 / provider / API key 由管理员在「用户管理 → 模型」授予，或用户在本实例的「我的模型」里自行添加；**普通用户能否自行添加 / 更改模型参数由管理员在「用户管理」里逐人开关，默认禁止**（见「模型自设审批」一节）；
 - handoff **10 分钟有效、一次性**（实例内存记录已兑换令牌的 sha256）；兑换后实例铸造常规 30 天 cookie，handoff 本身弃用；
 - HTTP cookie 按 Host 域隔离、**不按端口隔离**，因此 302 跨端口跳转到同一主机即可带票进入用户实例；
 - 用户实例绑定 `0.0.0.0`（复用 `dsh-lan-access`），局域网可达；每个实例受自己的门禁保护；
@@ -195,18 +195,51 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
 }
 ```
 
+## 模型配置落盘位置（管理员 vs 普通用户，各是哪一份文件）
+
+排障时最常问的一句是「这个用户的模型设置到底在哪个文件里」。答案是：**同一类文件，躺在两个不同的 `DSH_HOME` 里**——DSH 核心没有「按登录用户」的配置层，配置按进程 / 按 `DSH_HOME` 划分；本插件的多租户是在**进程级**叠上去的（每个普通用户一个独立 `dsh web` 进程 + 独立 `DSH_HOME` + 独立 OS uid，`spawn(..., {uid, gid})` 并注入 `DSH_HOME=<instances.root>/<username>`）。
+
+| 角色 | 进程 / 端口 | `DSH_HOME` | 模型配置（provider + 默认模型） | API 密钥 | 自助开关 |
+| --- | --- | --- | --- | --- | --- |
+| 管理员（`adminUsers`） | hub | 操作员自己的 home（本部署 `/root/.dsh`） | `<DSH_HOME>/profiles/web/cordis.patch.yml` | `<DSH_HOME>/.credentials.yaml` | 不适用（管理员无独立环境） |
+| 普通用户 | 该用户实例（`portBase` 起） | `<instances.root>/<username>` | `<DSH_HOME>/profiles/web/cordis.patch.yml` | `<DSH_HOME>/.credentials.yaml` | `<DSH_HOME>/dsh-login-model-policy.json` |
+
+- **管理员没有独立环境**：`adminUsers` 里的账号登录后直接进 hub 应用，`/dsh-login/users/models?user=<管理员>` 会被拒（`管理员直接使用 hub，没有独立环境`）。所以管理员自己的模型 = hub 的那一份文件，要改只能走 hub 自己的原生模型页（loopback 浏览器）或直接编辑该文件；本插件不提供「给管理员配模型」的通道。
+- **模型配置的真实文件是 `profiles/web/cordis.patch.yml`，不是 `settings.yaml`**：DSH 核心已移除 `settings.yaml`。模型页与本插件的写入都走 `settings/mutate` → 宿主 `ConfigEditor`（`documentPath = profileContext.patchPath`），落盘即当前 profile 的补丁文档；相关命名空间是 `llm-pi-ai`（provider 路由与模型目录）与 `agent-default-model`（默认选择）。参见 DSH 文档 `docs/user/guide/providers.zh.md`（「也就是模型页写入的同一份文档」）。
+- **`settings.yaml.imported` 是历史遗留，改它无效**：provisioning 写入的 `settings.yaml` 模板在实例**首次启动**时被 DSH 核心一次性导入 profile，随后原文件被改名为 `settings.yaml.imported`（`packages/settings/settings/src/index.ts` 的 `importLegacyDocument()`）。此后它不再被读取，只作为导入来源留档；hub 侧若也有同名文件，同理只是旧配置的存档。
+- **API 密钥永远只在 `.credentials.yaml`**：settings 里只写凭据引用名（约定 `<PROVIDER_ID>_API_KEY`，见 `providerRefName()`），密钥值不落进 `cordis.patch.yml`。
+- **`dsh-login-model-policy.json` 不是模型配置**：它只是「该用户能否自助改模型」的开关镜像（权威在数据库 `model_self_service` 列），内容只有 `{allowSelfService, updatedAt}`。
+- **实例 profile 带 `"patchReload": "live"`**（provisioning 写入，见 `lib/instances.js`；hub 自己的 profile 没有这一项）：实例侧手工编辑 `cordis.patch.yml` 通常会被 loader 热重载拾取，无需重启该实例；hub 侧没有该声明，改完建议重启 hub。手工编辑时保持 YAML 数组结构，并保留 provisioning 写入的 `terminal-controller` / `ui-sidebar-terminal` 的 `disabled` 行（默认关闭 GUI 终端）。
+- **对照排障命令**：
+
+  ```bash
+  # 某用户的 provider 与默认模型
+  cat /srv/dsh-users/<username>/profiles/web/cordis.patch.yml
+  # 该用户持有哪些凭据 ref（只看引用名，不外泄密钥值；块式与流式写法都能匹配）
+  grep -oE '[A-Z][A-Z0-9_]*_API_KEY' /srv/dsh-users/<username>/.credentials.yaml | sort -u
+  # 该用户的自助开关
+  cat /srv/dsh-users/<username>/dsh-login-model-policy.json
+  # 管理员自己的（hub）
+  cat "$DSH_HOME/profiles/web/cordis.patch.yml"
+  ```
+
+> 结论：「用户管理 → 模型」页保存后，改动落在**该用户自己**的 `cordis.patch.yml` + `.credentials.yaml`，绝不写 hub；hub 与租户的配置面因此天然互不污染（`model-config.js` 的模块注释即为此约定）。
+
 ## 用户实例 provisioning 细节
 
 用户**首次**登录/注册时自动执行（约 30s~2min，取决于 pnpm store 冷热）：
 
 ```
 /srv/dsh-users/<username>/
-  .credentials.yaml   ← 仅含 hub 的 browser-session 签名密钥（handoff 必需）0600
+  .credentials.yaml   ← 仅含 hub 的 browser-session 签名密钥（handoff 必需）0600；后续该用户自己的 API key 也写在这里
   settings.yaml       ← 模板：无 provider/密钥 + 隐藏内置 deepseek-official 目录
+                        （首次启动即被导入 profile，随后改名为 settings.yaml.imported）
   dsh-login.json      ← 实例模式配置（hub 写入） 0600
+  dsh-login-model-policy.json ← 模型自设开关镜像（hub 按数据库决定写入）0600
   instance.json       ← { port, pid, startedAt, provisionedAt }
   web.log             ← 实例 stdout/stderr（排障看这里）
   profiles/web/       ← 实例 profile：dsh-base + dsh-web-app + dsh-lan-access + dsh-login(file: 拷贝)
+    cordis.patch.yml  ← 真正的模型配置所在（provider / 默认模型 / 关闭 GUI 终端）
   sessions/ storages/ ← 运行期自动创建
 ```
 
@@ -244,7 +277,7 @@ node --import <checkout>/node_modules/tsx/dist/esm/index.mjs \
 **从 root 模式升级**：home 属主仍是 root 时，下一次 `ensure()` 会打印 `migrating <user>'s home to <osUser>`，先停掉 `instance.json` 记录的进程（用 `/proc/<pid>/cmdline` 校验 pid 未被回收才发信号）、按 copy 方式重装 profile 依赖、再 chown。**布局前提**：`/root` 是 0700，租户够不到 `/root/dsh-users/**`，因此实例根目录必须在 `/root` 之外（默认 `/srv/dsh-users`）：把 `instances.root` 改到新路径，并 `mv` 旧目录。
 
 **挡得住**：另一个租户（或该租户自己）在 `danger-full-access` 会话里读 hub 的 `/root/.dsh`（含管理员 `DEEPSEEK_API_KEY` 与 `dsh-login.json` 里的数据库口令）、读写 `/stp-harness` 检出、读写邻居的 home/会话。
-**挡不住**：租户对自己的 `settings.yaml`/`.credentials.yaml`/实例 `/api` 仍有完全控制（那是他自己的东西）；网络不做限制（仍可访问内网/数据库端口，但已拿不到 hub 里的数据库口令与管理员 key）；hub 仍是 root，请保持 `instances.root`、checkout、hub home 的属主与权限不变。
+**挡不住**：租户对自己的 `profiles/web/cordis.patch.yml`/`.credentials.yaml`/实例 `/api` 仍有完全控制（那是他自己的东西）；网络不做限制（仍可访问内网/数据库端口，但已拿不到 hub 里的数据库口令与管理员 key）；hub 仍是 root，请保持 `instances.root`、checkout、hub home 的属主与权限不变。
 
 **不要手工 `rm -rf /srv/dsh-users/<u>` 删用户目录（重要）**：若其实例仍在运行，旧进程会继续占着端口、却服务一个已被删除的 home。症状是 GUI 里 `本轮运行失败 ENOENT: ... /sessions/<id>/session.v3.jsonl.zstd`（旧目录已删，它内存中的会话指向不存在的文件），而且新实例抢端口会 `EADDRINUSE` 崩溃。请改用「用户管理 → 删除」（`manager.remove()` 先 SIGTERM 再删目录）。
 
@@ -283,7 +316,7 @@ WebSocket 服务端会**先写出 `101` 响应**，随后从 `head` 排空「握
 | `/dsh-login/users/status` | POST | **注册审批**（仅管理员）：`{user, action: "approve"\|"reject"}` → 把该账号置为 `approved`/`rejected`。管理员账号不可改；Origin 校验 |
 | `/dsh-login/users/model-policy` | POST | **模型自设审批**（仅管理员）：`{user, allow: true\|false}` → 写 `model_self_service` 列 + 该用户 `DSH_HOME/dsh-login-model-policy.json` 镜像（实例立即生效，无需重启）。管理员账号无此开关；Origin 校验 |
 | `/dsh-login/users` | GET | 表格含**状态**列、「通过/拒绝」按钮、**自行设置模型**列与「允许 / 禁止自行设置模型」按钮，以及"有 N 个账号等待审批"提示 |
-| `/dsh-login/users/models` | GET/POST | **配置某用户的模型**（仅管理员，`?user=<名>`）：GET 显示该用户当前 provider/默认模型 + 表单；POST 校验后写入**该用户自己**的 `settings.yaml` + `.credentials.yaml`。见下节 |
+| `/dsh-login/users/models` | GET/POST | **配置某用户的模型**（仅管理员，`?user=<名>`）：GET 显示该用户当前 provider/默认模型 + 表单；POST 校验后写入**该用户自己**的 `profiles/web/cordis.patch.yml` + `.credentials.yaml`。见下节 |
 
 ### 为什么需要「配置某用户的模型」这一页
 
@@ -312,7 +345,7 @@ DSH 有意**只允许 loopback 页面编辑 host 的 settings/credentials**（`p
 | `/dsh-login/state` | GET | `{authenticated, instance: true}` |
 | `/dsh-login/account` | GET | **账户中心（实例侧）**：当前环境端口 + 「我的模型」入口（被管理员关闭时不提供链接）+ 开关状态标记 + 退出登录（完全退出）。需内置 cookie |
 | `/dsh-login/models` | GET | **我的模型（用户自助）**：当前 provider 列表（含 API key 状态/默认标记）+ 默认模型 + 添加表单（内置预设 / 自定义）。**管理员关闭该功能时返回 403「管理员已关闭」页**。需内置 cookie，未登录 302 回 hub 登录页 |
-| `/dsh-login/models` | POST | 保存新增/更新的 provider（表单或 JSON：`kind`、`presetId`/`providerId`、`displayName`、`api`、`baseURL`、`models`、`apiKey`、`setDefault`、`defaultModel`）。**只写本实例**的 `settings.yaml` + `.credentials.yaml`（经本实例自己的 `/api`）。未获批准一律 **403**（写入前判定）；Origin 校验；失败 400 回显表单（**不回显 key**）；成功 303 回本页 |
+| `/dsh-login/models` | POST | 保存新增/更新的 provider（表单或 JSON：`kind`、`presetId`/`providerId`、`displayName`、`api`、`baseURL`、`models`、`apiKey`、`setDefault`、`defaultModel`）。**只写本实例**的 `profiles/web/cordis.patch.yml` + `.credentials.yaml`（经本实例自己的 `/api`）。未获批准一律 **403**（写入前判定）；Origin 校验；失败 400 回显表单（**不回显 key**）；成功 303 回本页 |
 | `/dsh-login/models/delete` | POST | 删除 provider：`{id}`。功能被关闭时 **403**；先 `credentials/unset` 约定 ref（`<ID>_API_KEY`）再 unset profile（与 DSH 原生页同序）；不存在的 id 返回 `{ok:true, removed:false}`。Origin 校验 |
 | `/dsh-login/models/default` | POST | 设默认模型：`{provider, model}`。功能被关闭时 **403**；写 `agent-default-model` 并 unset 残留的 `reasoningEffort`（沿用值会打断会话）。provider 须已配置。Origin 校验 |
 | `/dsh-login/models/models-of` | GET | `?id=<provider>`：返回该 provider 的模型列表（内置预设走 pi-ai 本地目录，无网络调用；自定义/未知路由 503）。功能被关闭时 **403**。供页面填充默认模型下拉框 |
@@ -369,7 +402,7 @@ rm -rf /srv/dsh-users/<username>
 - **管理员操作面**（`/dsh-login/users`、`/dsh-login/users/status`、`/dsh-login/users/model-policy`、`/dsh-login/enter`、`/dsh-login/users/delete`）三重门槛：有效 hub 会话 + 该会话属于 `adminUsers` +（POST）同源 Origin 校验；删除操作另禁止删除自己。`enter` 的 POST **不写任何 hub 会话 cookie**，因此管理员"以某用户身份进入"不会顶掉自己的 hub 身份；
 - **信任模型说明**：hub 与所有用户实例共享同一 browser-session 签名密钥（provisioning 时以 `renderInstanceCredentials` 单独写入这一条记录），这是 hub 能铸造 handoff 的前提；除此之外用户实例不持有 hub 的任何凭据。该密钥等价于「对本机 GUI 的完全访问权」；启用 `instances.isolation: "uid"`（默认）后租户实例以各自的非特权 uid 运行（hub 仍是 root，租户之间互不相通），因此它不再等于「主机上的完全访问权」——租户只能触碰自己的 home（见「多租户隔离」）。
 - **我的模型（用户自助页）**：不引入新权限——持有本实例内置 cookie 者本就能直接调该实例的 `/api`（门禁对 `/api` 一视同仁放行），页面只是把这些调用收进同一 Origin、同一 cookie 的受控表单：所有 POST 均有 Origin 同源校验；API key 只在表单提交时经回环传给本实例自己的 `/api`，页面任何渲染/回显都**不包含** key（失败回显仅保留除 key 外的字段）；预设表的 baseURL/模型 ID 是静态数据（来自 `lib/provider-presets.js`，与 pi-ai 目录核对一致），用户可自定义 baseURL 的能力类与管理员代管页、loopback 原生页完全相同（既有信任边界不变）。
-- **模型自设开关**：它是**逐人的管理策略**，由实例侧在整条 `/dsh-login/models*` 路径上服务端强制（未批准时 GET 返回 403「已关闭」页、所有写路由与 `models-of` 一律 403，不只是隐藏按钮），镜像文件缺失/损坏按禁止处理（fail closed）。需要明确的边界是：它约束的是本插件的自助接口，而不是一个针对实例所有者的硬沙箱——实例以**该用户自己的非特权 uid** 运行（隔离只隔开租户之间与 hub，不隔开用户与自己的 home），其所有者本就能触碰同一份 `settings.yaml`/`.credentials.yaml` 与实例自身的 `/api`（见上一条的既有信任模型）。对普通用户「不许改模型」的强保证需要在操作系统/DSH 核心层面做隔离，不属于本插件的范围。
+- **模型自设开关**：它是**逐人的管理策略**，由实例侧在整条 `/dsh-login/models*` 路径上服务端强制（未批准时 GET 返回 403「已关闭」页、所有写路由与 `models-of` 一律 403，不只是隐藏按钮），镜像文件缺失/损坏按禁止处理（fail closed）。需要明确的边界是：它约束的是本插件的自助接口，而不是一个针对实例所有者的硬沙箱——实例以**该用户自己的非特权 uid** 运行（隔离只隔开租户之间与 hub，不隔开用户与自己的 home），其所有者本就能触碰同一份 `profiles/web/cordis.patch.yml`/`.credentials.yaml` 与实例自身的 `/api`（见上一条的既有信任模型）。对普通用户「不许改模型」的强保证需要在操作系统/DSH 核心层面做隔离，不属于本插件的范围。
 
 ## 已知边界
 
@@ -382,6 +415,6 @@ rm -rf /srv/dsh-users/<username>
 - 注册自动登录时 `last_login_at` 保持 NULL（只有显式登录才更新该列），属既有行为。
 - 用户实例端口稳定不变（`instance.json` 持久化）；若端口被其他长期占用，实例就绪探测会失败并在下次登录时报 503，处理掉占用或调高 `instances.portBase` 后重新 provisioning 即可。
 - 用户实例镜像 `instances.checkout` 上 hub 的启动平面：hub 跑编译产物时，实例也跑 `apps/cli/lib/*`（checkout 的源码改动需要重新构建后**新启动**的实例才会生效）；hub 以 tsx 跑源码时实例跑源码。checkout 更新不影响运行中实例。
-- 「我的模型」自助页是实例侧新增路由：升级插件后**已存在的用户实例**仍跑旧版插件（见「安装 / 升级」第 3 条），该用户重新 provisioning（删目录 + 重新登录）或在其 `profiles/web` 重跑 `pnpm install` 后才有此页（同理，模型自设开关也只有在实例跑新版插件后才会被强制）；升级前添加的 provider 数据不受影响（都在该用户的 `settings.yaml` 里）。升级后所有用户**默认禁止**自行设置模型，需管理员在「用户管理」里显式批准。
+- 「我的模型」自助页是实例侧新增路由：升级插件后**已存在的用户实例**仍跑旧版插件（见「安装 / 升级」第 3 条），该用户重新 provisioning（删目录 + 重新登录）或在其 `profiles/web` 重跑 `pnpm install` 后才有此页（同理，模型自设开关也只有在实例跑新版插件后才会被强制）；升级前添加的 provider 数据不受影响（都在该用户的 `profiles/web/cordis.patch.yml` 里）。升级后所有用户**默认禁止**自行设置模型，需管理员在「用户管理」里显式批准。
 - 右下角「账户」悬浮按钮经 `webserver/index-inject` 注入；若未来 DSH webserver 移除/改名该注入事件，按钮不再出现，但所有 `/dsh-login/*` 页面仍可手动访问，功能不受影响。
 - 「以该用户身份进入」是**管理员特权**（等同以该用户身份操作其环境）；仅建议在排障/代管时使用。被进入用户无法从环境中区分访问者是其本人还是管理员（同机同密钥的既有信任模型使然）。

@@ -3,7 +3,7 @@
 为 DeepSeek Harness Web GUI 提供**基于数据库的多用户登录门禁 + 每用户独立工作区**：
 
 - **hub**（操作员的 `dsh web`，本部署为 3080 端口）是唯一登录面：登录页支持**注册**与**登录**，注册把新账号写入 MySQL 账号表（本部署为 `dsh` 库的 `dsh_login` 表），登录先用数据库认证，**认证通过才能使用应用**；
-- **管理员**（配置 `adminUsers`）登录后直接进入 hub 应用（3080），行为与单用户门禁时代完全一致；
+- **管理员**（配置 `adminUsers`）登录后直接进入 hub 应用（3080），行为与单用户门禁时代完全一致；若登录页的 `next` 指向某个**用户实例端口**（例如直接在地址栏打开 `http://<host>:3100/` 被弹回登录页），登录后不会再次撞回该端口，而是转到该实例所有者的「以该用户身份进入」确认页（见「关键机制」）；
 - **普通用户**登录/注册成功后，hub 自动为其供给一个**独立的 dsh web 实例**：独立 `DSH_HOME`（`/srv/dsh-users/<username>/`）、独立端口（3100 起）、独立会话/设置/工作区，并运行在该用户**专属的非特权 OS 账号**下（见「多租户隔离」）——每个用户的工作区彼此隔离、互不影响。
 
 本插件是 `dsh web` 宿主侧插件（纯 Node.js，无构建步骤），以 bundle 形式挂入 web profile，替换了原 `dsh-lan-gate` 的固定密码门禁。同一份代码以两种模式运行（由 `$DSH_HOME/dsh-login.json` 决定）：
@@ -38,6 +38,7 @@
 - **每个用户实例的配置完全独立**：`settings.yaml` 以 `INSTANCE_SETTINGS_TEMPLATE` 起步——不含任何 provider/密钥，并写入 `llm-deepseek: { models: [] }` 以**隐藏 DSH 自带的 `deepseek-official` 目录**（该目录随 `@deepseek-ai/dsh-base` 提供、与管理员配置无关，且没有 `DEEPSEEK_API_KEY` 时不可用）。该模板在实例**首次启动时就被 DSH 核心一次性导入 profile**，真正的模型配置此后住在 `profiles/web/cordis.patch.yml`（见「模型配置落盘位置」一节）。模型 / provider / API key 由管理员在「用户管理 → 模型」授予，或用户在本实例的「我的模型」里自行添加；**普通用户能否自行添加 / 更改模型参数由管理员在「用户管理」里逐人开关，默认禁止**（见「模型自设审批」一节）；
 - handoff **10 分钟有效、一次性**（实例内存记录已兑换令牌的 sha256）；兑换后实例铸造常规 30 天 cookie，handoff 本身弃用；
 - HTTP cookie 按 Host 域隔离、**不按端口隔离**，因此 302 跨端口跳转到同一主机即可带票进入用户实例；
+- **管理员从地址栏打开用户实例端口不会形成登录循环**：实例只接受「绑定自身 authority 的 handoff」或「自己铸造的内置 cookie」，hub 对从地址栏进来的管理员两者都不签发；若登录后按 `next` 直接 302 到该端口，实例会立刻把浏览器弹回登录页，而 `next` 仍是该实例的绝对 URL——浏览器就在登录页与该端口之间来回，表现为「点登录闪一下又回到登录页」。因此 `adminLoginTarget` 把指向**已供给实例端口**的 `next` 改写为 `/dsh-login/enter?user=<owner>`（该流程才铸造实例接受的 handoff）；端口不在实例端口缓存里（未供给/已删除）时保持原样直放；
 - 用户实例绑定 `0.0.0.0`（复用 `dsh-lan-access`），局域网可达；每个实例受自己的门禁保护；
 - 用户实例以 **detached** 方式启动：hub 重启（含 Ctrl+C）不连带杀死；hub 重启时从 `instance.json` 重新**收养**；实例进程挂掉时下次登录**懒拉起**。
 
@@ -95,6 +96,7 @@
 | `cordis.patch.yml` | bundle 补丁：向 profile 树插入插件行 |
 | `test/gate.test.mjs` | 集成测试（假宿主 + 真实 MySQL + 租户原语） |
 | `test/sqlite-store.test.mjs` | 内置 SQLite 存储测试（驱动选择矩阵、与 MySQL 驱动的方法面一致性、老表补列、文件 0600、`bin/verify.mjs` 离线验收；**不需要 MySQL**） |
+| `test/admin-instance-next.test.mjs` | 管理员 `next` 指向实例端口时改走进入确认页的回归测试（**不需要 MySQL**） |
 | `test/my-models.test.mjs` | 用户自助模型页测试（预设表/校验/写入序列/自设开关镜像与门禁/假宿主集成；**不需要 MySQL**） |
 | `test/client-half.test.mjs` | 浏览器半边测试（VM 内执行 bundle + 假 ctx/fetch：管理员注册入口、非管理员不注册；**不需要 MySQL**） |
 | `test/inner-real.spec.mjs` | 与运行中 dsh web 的字节兼容性验证（对已部署门禁的宿主自动跳过） |
@@ -402,7 +404,7 @@ node vendor/dsh-login/bin/verify.mjs --base-url "http://<局域网IP>:3080"   # 
 | `/dsh-login/state` | GET | `{authenticated, username?, admin?, db: "up"|"down", dbDriver: "sqlite"|"mysql", register, instance?: {port, running}}`（`admin` 供浏览器半边判定是否贡献右侧边栏入口） |
 | `/dsh-login/health` | GET | `{ok: true, db: "up"|"down", dbDriver: "sqlite"|"mysql"}` |
 | `/dsh-login/account` | GET | **账户中心**：当前登录身份与角色、（普通用户）自己的实例地址/状态、退出登录、（管理员）用户管理入口。未登录 302 到登录页 |
-| `/dsh-login/users` | GET | **用户管理**（仅管理员）：全部账号（创建/最近登录时间）+ 实例（端口/运行状态）+ 操作：以该用户进入、打开、删除 |
+| `/dsh-login/users` | GET | **用户管理**（仅管理员）：全部账号（创建/最近登录时间）+ 实例（端口/运行状态）+ 操作：以该用户进入、打开（新窗口，同样走进入确认页，不直连实例端口）、删除 |
 | `/dsh-login/enter` | GET/POST | **以该用户身份进入**（仅管理员）：GET 渲染确认页（并先行确保实例就绪）；POST 铸造 handoff 302 到该用户实例。**不设置任何 hub 会话 cookie**——管理员的 hub 身份保持不变，浏览器同时持有两边会话 |
 | `/dsh-login/users/delete` | POST | **删除用户**（仅管理员）：停止并删除其实例（进程 + `DSH_HOME` 目录）+ 删除 DB 行。禁止删除自己；Origin 校验 |
 | `/dsh-login/users/status` | POST | **注册审批**（仅管理员）：`{user, action: "approve"\|"reject"}` → 把该账号置为 `approved`/`rejected`。管理员账号不可改；Origin 校验 |

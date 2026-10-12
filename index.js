@@ -249,6 +249,38 @@ function absoluteNextAllowed(portBase) {
   }
 }
 
+/**
+ * Where an authenticated administrator is sent after logging in.
+ *
+ * A `next` that names one of this deployment's instance ports cannot be
+ * honoured for an administrator: that instance admits only a handoff token
+ * bound to its own authority or a browser cookie it minted itself, and the hub
+ * issues neither when an administrator walks in from the address bar. The
+ * instance bounces the browser straight back to the login page, so the page
+ * looks like it refuses to log in — the browser arrives at the login page with
+ * an instance-port `next`, submits, and is thrown at the same instance again.
+ * The enter confirmation for that instance's owner is the path that mints the
+ * handoff the instance accepts, so an administrator aiming at a live instance
+ * port is routed there instead of at the port itself.
+ * @param next - the validated login redirect target.
+ * @param ports - username to instance port, as adopted at boot and on each ensure.
+ * @returns the location to send the administrator to.
+ */
+export function adminLoginTarget(next, ports) {
+  if (!next.startsWith('http://') && !next.startsWith('https://')) return next
+  let port
+  try {
+    port = new URL(next).port
+  } catch {
+    return next
+  }
+  if (port === '') return next
+  for (const [owner, ownerPort] of ports) {
+    if (String(ownerPort) === port) return `${ENTER_PATH}?user=${encodeURIComponent(owner)}`
+  }
+  return next
+}
+
 /** The login page redirect target for one unauthenticated request. */
 function loginRedirect(req) {
   try {
@@ -733,14 +765,17 @@ export function apply(ctx) {
     // body); absolute URLs are only accepted for this host's instance ports.
     const next = safeNext(body.next, '/', absoluteNextAllowed(cfg.instances.portBase))
     if (isAdmin(username)) {
+      // An instance-port `next` is answered with that instance's enter
+      // confirmation, not with the port itself (see adminLoginTarget).
+      const target = adminLoginTarget(next, knownPorts)
       const cookies = await loginCookies(req, username, true)
       if (wantsJson(req)) {
         res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': cookies, 'cache-control': 'no-store' })
-        res.end(JSON.stringify({ ok: true, target: next }))
+        res.end(JSON.stringify({ ok: true, target }))
         return
       }
       res.writeHead(302, {
-        location: next,
+        location: target,
         'set-cookie': cookies,
         'cache-control': 'no-store',
       })
@@ -834,14 +869,15 @@ export function apply(ctx) {
     // An approved fresh registration logs the user in immediately (they just
     // proved the password). Regular users land on their own instance.
     if (isAdmin(username)) {
+      const target = adminLoginTarget(next, knownPorts)
       const cookies = await loginCookies(req, username, true)
       if (wantsJson(req)) {
         res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': cookies, 'cache-control': 'no-store' })
-        res.end(JSON.stringify({ ok: true, target: next }))
+        res.end(JSON.stringify({ ok: true, target }))
         return
       }
       res.writeHead(302, {
-        location: next,
+        location: target,
         'set-cookie': cookies,
         'cache-control': 'no-store',
       })

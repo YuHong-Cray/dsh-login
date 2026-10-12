@@ -77,7 +77,10 @@
 | --- | --- |
 | `index.js` | 插件入口：hub/instance 双模式门禁、`/dsh-login/*` 路由、handoff 铸造与兑换 |
 | `lib/config.js` | 部署配置读写（`$DSH_HOME/dsh-login.json`，hub/instance 双模式） |
-| `lib/db.js` | MySQL 访问（mysql2 连接池、建表、注册/查询/更新/删除，全部参数化 SQL；仅 hub 模式惰性加载） |
+| `lib/db-driver.js` | 账号存储驱动选择：按配置实例化 SQLite 或 MySQL 驱动（惰性 import，两者方法面完全一致），并提供启动日志里的存储描述 |
+| `lib/db-sqlite.js` | **默认账号存储**：`node:sqlite`（Node 内置，零依赖、无需编译）；库文件与表在首次使用时自动创建，文件恒为 0600 |
+| `lib/db.js` | MySQL 访问（mysql2 连接池、建表、注册/查询/更新/删除，全部参数化 SQL；仅 hub 模式**且配置了 MySQL** 时才惰性加载，需自行 `npm install mysql2`） |
+| `lib/account-status.js` | 账号状态常量（`approved` / `pending` / `rejected`），两个驱动共用且不牵连任何依赖 |
 | `lib/auth.js` | scrypt 密码哈希、会话存储、限流、cookie 工具 |
 | `lib/inner.js` | 内置会话 cookie / handoff 令牌的铸造与校验（与 BrowserAuth 字节兼容） |
 | `lib/instances.js` | 用户实例生命周期：端口分配、provisioning（DSH_HOME/profile/pnpm install）、detached 启动、就绪探测、收养、删除 |
@@ -88,8 +91,10 @@
 | `lib/cidr.js` | IPv4 CIDR / 回环地址判断 |
 | `lib/page.js` | 登录页（自包含 HTML/CSS/JS，深色主题，登录/注册双页签） |
 | `lib/client.js` | **浏览器半边**：管理员登录后在右侧边栏「开始」页贡献「用户管理」入口，点开即在侧边栏内嵌 `/dsh-login/users`。按 client module system 的 bundle 格式手写（本插件无构建步骤），角色取自 `/dsh-login/state` 的 `admin` 字段 |
+| `bin/verify.mjs` | **部署完成后的验收流程**：配置 → 账号存储（含自动建库）→ 会话密钥 → 账号表 → HTTP 门禁往返 → 租户实例 → 隔离权限，逐条 ✔/⚠/✘ 并给修复提示，退出码 0 才算通过 |
 | `cordis.patch.yml` | bundle 补丁：向 profile 树插入插件行 |
 | `test/gate.test.mjs` | 集成测试（假宿主 + 真实 MySQL + 租户原语） |
+| `test/sqlite-store.test.mjs` | 内置 SQLite 存储测试（驱动选择矩阵、与 MySQL 驱动的方法面一致性、老表补列、文件 0600、`bin/verify.mjs` 离线验收；**不需要 MySQL**） |
 | `test/my-models.test.mjs` | 用户自助模型页测试（预设表/校验/写入序列/自设开关镜像与门禁/假宿主集成；**不需要 MySQL**） |
 | `test/client-half.test.mjs` | 浏览器半边测试（VM 内执行 bundle + 假 ctx/fetch：管理员注册入口、非管理员不注册；**不需要 MySQL**） |
 | `test/inner-real.spec.mjs` | 与运行中 dsh web 的字节兼容性验证（对已部署门禁的宿主自动跳过） |
@@ -104,7 +109,23 @@
 
 ## 账号表
 
-表名由配置 `db.table` 指定（本部署为 `dsh_login`）。表不存在时插件会自动创建；已存在则直接使用（要求至少包含 `username` 与 `password_hash` 两列，`username` 需有唯一索引）。参考 DDL：
+### 用哪个库：不配 MySQL，就自助建一个 SQLite
+
+账号存储有两个可互换后端，**MySQL 是可选项而不是前提**（`lib/config.js` 的 `normalizeDb()` 决定，`lib/db-driver.js` 实例化）：
+
+| 配置写法 | 结果 |
+| --- | --- |
+| 完全不写 `db`（或只写 `db.table`） | **SQLite**：`$DSH_HOME/dsh-login-accounts.sqlite`，首次使用时自动建库建表，文件 0600 |
+| 写了 `db.host` + `db.user` + `db.database` | **MySQL**（共享/企业账号表），需 `npm install mysql2` |
+| `"db": { "driver": "sqlite", "file": "/var/lib/dsh/accounts.sqlite" }` | 显式钉住 SQLite 并指定库文件（必须绝对路径） |
+| `"db": { "driver": "mysql", ... }` | 显式钉住 MySQL |
+
+- 判定规则是「**三个字段有没有出现**」：只写了其中一两个（例如只有 `host`）会**直接报错**而不是退回 SQLite——静默换库会把账号从操作员想连的共享表里搬走，第一次登录就会表现为"账号不存在"；
+- SQLite 走 Node 内置的 `node:sqlite`（Node 22.5 起提供；本部署 Node v22.23.2 无需任何 flag，个别更早的 22.x 需要 `--experimental-sqlite`），**没有依赖、没有编译、没有下载**，因此"零依赖部署"是默认形态；首次使用会打印一次 `ExperimentalWarning: SQLite is an experimental feature`，属正常现象（本插件不屏蔽警告）；
+- 两个后端的表结构、方法面、默认值、迁移行为完全一致，日后换 MySQL 只是搬数据（`mysqldump`/导入），不改代码；
+- 库文件里存的是 scrypt 口令校验值，因此驱动每次打开都会把权限收紧回 0600（即使被外部 `chmod` 放宽）；它与 `.credentials.yaml` 属同一机密级别，**不在默认备份范围内**。
+
+表名由配置 `db.table` 指定（本部署为 `dsh_login`）。表不存在时插件会自动创建；已存在则直接使用（要求至少包含 `username` 与 `password_hash` 两列，`username` 需有唯一索引）。MySQL 参考 DDL：
 
 ```sql
 CREATE TABLE IF NOT EXISTS `dsh_login` (
@@ -118,7 +139,21 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
 );
 ```
 
-> 升级：`ensureTable()` 会为老表自动补齐 `status`（默认 `'approved'`）与 `model_self_service`（默认 `0`）两列。
+SQLite 侧同形（时间列用 `strftime('%Y-%m-%dT%H:%M:%SZ','now')` 存 ISO-8601 UTC，避免裸 `CURRENT_TIMESTAMP` 无时区被 JS 按本地时间解析）：
+
+```sql
+CREATE TABLE IF NOT EXISTS "dsh_login" (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  username           TEXT    NOT NULL UNIQUE,
+  password_hash      TEXT    NOT NULL,
+  status             TEXT    NOT NULL DEFAULT 'approved',
+  model_self_service INTEGER NOT NULL DEFAULT 0,
+  created_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  last_login_at      TEXT
+);
+```
+
+> 升级：`ensureTable()` 会为老表自动补齐 `status`（默认 `'approved'`）与 `model_self_service`（默认 `0`）两列——两个后端的默认值一致：老账号仍可登录，但**不会**在升级时白拿到自助改模型的权限。
 
 ## 部署配置
 
@@ -127,6 +162,7 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
 ```json
 {
   "db": {
+    "driver": "mysql",
     "host": "192.168.0.100",
     "port": 3306,
     "user": "dsh_user",
@@ -148,6 +184,18 @@ CREATE TABLE IF NOT EXISTS `dsh_login` (
   }
 }
 ```
+
+**最小可用配置（不配数据库）**——这一份就能跑通「注册 → 审批 → 登录 → 开通实例」的整套流程，账号存在自动创建的 `$DSH_HOME/dsh-login-accounts.sqlite` 里：
+
+```json
+{
+  "allowCidrs": ["10.0.0.0/8", "192.168.0.0/16"],
+  "adminUsers": ["admin"],
+  "instances": { "root": "/srv/dsh-users", "checkout": "/deepseek-harness" }
+}
+```
+
+- `db.driver`：`auto`（默认）/ `mysql` / `sqlite`。`auto` 下按 `db.host`+`db.user`+`db.database` 是否出现判定；三者只出现一部分会**报错**（不静默换库）。`sqlite` 可配 `db.file`（绝对路径，默认 `$DSH_HOME/dsh-login-accounts.sqlite`）。
 
 - `adminUsers`：管理员账号列表（2–32 位，字符集同用户名规则）；**留空/省略 = 无管理员**（所有用户都走独立实例）。管理员**不受注册审批约束**。
 - `register`：`open` 开放自助注册；`disabled` 关闭注册（登录页只保留登录页签）。
@@ -297,6 +345,50 @@ WebSocket 服务端会**先写出 `101` 响应**，随后从 `head` 排空「握
 
 原因：JS 读不到重定向的 `Location`——`fetch(…, {redirect:'manual'})` 返回的是 **opaque 响应（`status` 为 0、headers 不可读）**，而 `redirect:'follow'` 在跨端口（跨源）时响应同样不可读。若误用前者，症状是**点登录后新窗口一闪即关、仍停在登录页**（并显示 `请求失败（0）`）。因此跨端口目标必须由服务端显式下发。
 
+## 部署完成后的验收（`bin/verify.mjs`）
+
+部署跑完（或改完配置）后，在 hub 主机上跑一次验收。它只回答一个问题：**这套部署现在能登录吗？**
+
+```bash
+node bin/verify.mjs                                    # 读 $DSH_HOME（未设置则 ~/.dsh）
+node bin/verify.mjs --home /root/.dsh --base-url http://127.0.0.1:3080
+node bin/verify.mjs --offline                          # 只查落盘状态（provisioning 阶段用）
+node bin/verify.mjs --strict                           # 警告也算失败
+```
+
+七组检查逐条输出 ✔ / ⚠ / ✘，失败项带「修复」提示；退出码 0 = 没有 ✘（默认允许 ⚠，`--strict` 时 ⚠ 也算失败），1 = 至少一条 ✘：
+
+| 组 | 检查内容 |
+| --- | --- |
+| 1 配置 | `dsh-login.json` 存在且可解析、模式为 hub、`instances.checkout` 指向可安装的源码树、管理员名单与审批开关是否合理 |
+| 2 账号存储 | 按配置解析出驱动 → `ensureTable()`（**SQLite 部署在这一步就把库和表建出来**）→ `health()`；SQLite 还查库文件是否存在、权限是否 0600、目录是否可写；MySQL 连不上会提示跑 `node test/db-probe.mjs` |
+| 3 会话密钥 | `$DSH_HOME/.credentials.yaml` 里有 `client-connection/browser-session` 记录（缺了则 hub 重启会把所有人登出） |
+| 4 账号表 | 账号总数与 `approved/pending/rejected` 分布；`adminUsers` 里的名字是否已注册；是否有账号卡在待审批；自助改模型的授权数 |
+| 5 HTTP 门禁 | `/dsh-login/health`（含 `db=up` 与运行中驱动是否和配置文件一致）、`/dsh-login/state`、登录页可渲染、外站 Origin 的 POST 被拒（CSRF）、临时账号跑「注册→pending→登录 403→错口令 401→审批写库→删除」 |
+| 6 实例面 | 每个已开通租户：`instance.json`、`instance: true` 配置、`.credentials.yaml`、`profiles/web/package.json` 已安装、模型自设开关的**库内值与 home 镜像是否一致**、端口是否在跑 |
+| 7 隔离权限 | `instances.root` 属主为 root 且权限不宽、不在 `/root` 下（uid 隔离需要穿越）、各租户 home 属主是其自己的 uid 而非 root |
+
+要点：
+
+- 它只碰一个东西：临时账号 `dsh-verify-<hex>`，用完即删（`--keep-account` 可保留）；不改动任何既有账号；
+- **不会**用真实已批准账号登录——普通用户登录成功会触发 provisioning（开通一个租户实例，30s–2min）。要把这条链路一起验收，显式加 `--with-handoff`（会真的开通一个实例，脚本会提示怎么删）；
+- 在回环地址上「未登录被拦到登录页」这条无法验证（本机回环放行是设计行为），要用局域网地址跑 `--base-url` 才会检查；
+- 负向登录会消耗该源 IP 的登录失败配额（运行中的 hub 为 10 次 / 15 分钟）；
+- 第 5 组会比对运行中进程的 `dbDriver` 与配置文件里的驱动（⚠ 提示"改过 `dsh-login.json` 需要重启 hub 才生效"）。该字段只有跑当前版本插件的 hub 才会返回，旧版 hub 上这条自动跳过、不算失败；
+
+零依赖部署的完整序列（新机器从零到可用）：
+
+```bash
+cd "$DSH_HOME/profiles/web" && pnpm install                      # 1. 装插件（vendor/dsh-login 已在 workspace 内）
+$EDITOR "$DSH_HOME/dsh-login.json"                               # 2. 最小配置：不写 db 即可（见上文「最小可用配置」）
+dsh web --host 0.0.0.0 --port 3080                               # 3. 启动 hub
+node vendor/dsh-login/bin/verify.mjs --offline                   # 4. 落盘层验收（顺带建出 SQLite 库表）
+# 5. 打开登录页注册管理员账号（adminUsers 里的名字，注册即 approved）
+node vendor/dsh-login/bin/verify.mjs --base-url "http://<局域网IP>:3080"   # 6. 全量验收（含 HTTP 往返与临时账号）
+```
+
+（在插件目录里直接跑 `node bin/verify.mjs` 也一样；`npm run verify` 是同一件事。验收不依赖 `DSH_HOME` 环境变量——它按 `--home` 读配置。）
+
 ## 运维接口
 
 ### hub 侧（3080）
@@ -307,8 +399,8 @@ WebSocket 服务端会**先写出 `101` 响应**，随后从 `head` 排空「握
 | `/dsh-login/login` | POST | 登录（JSON 或表单：`username`、`password`、`next`） |
 | `/dsh-login/register` | POST | 注册（`username`、`password`、`password2`），成功后自动登录（普通用户直接进入其实例） |
 | `/dsh-login/logout` | GET/POST | 退出 hub 会话 |
-| `/dsh-login/state` | GET | `{authenticated, username?, admin?, db: "up"|"down", register, instance?: {port, running}}`（`admin` 供浏览器半边判定是否贡献右侧边栏入口） |
-| `/dsh-login/health` | GET | `{ok: true, db: "up"|"down"}` |
+| `/dsh-login/state` | GET | `{authenticated, username?, admin?, db: "up"|"down", dbDriver: "sqlite"|"mysql", register, instance?: {port, running}}`（`admin` 供浏览器半边判定是否贡献右侧边栏入口） |
+| `/dsh-login/health` | GET | `{ok: true, db: "up"|"down", dbDriver: "sqlite"|"mysql"}` |
 | `/dsh-login/account` | GET | **账户中心**：当前登录身份与角色、（普通用户）自己的实例地址/状态、退出登录、（管理员）用户管理入口。未登录 302 到登录页 |
 | `/dsh-login/users` | GET | **用户管理**（仅管理员）：全部账号（创建/最近登录时间）+ 实例（端口/运行状态）+ 操作：以该用户进入、打开、删除 |
 | `/dsh-login/enter` | GET/POST | **以该用户身份进入**（仅管理员）：GET 渲染确认页（并先行确保实例就绪）；POST 铸造 handoff 302 到该用户实例。**不设置任何 hub 会话 cookie**——管理员的 hub 身份保持不变，浏览器同时持有两边会话 |
@@ -386,7 +478,9 @@ rm -rf /srv/dsh-users/<username>
 1. 修改插件源码后**无需构建**（纯 ESM JS），也无需重新 `pnpm install`（符号链接即时生效），只需重启 `dsh web` 使插件代码生效；
 2. `dsh-login.json` 配置在每次启动时读取，改完同样需要重启；
 3. **注意**：用户实例里的插件是 provisioning 时的拷贝（pnpm `file:` 依赖）。hub 侧升级插件后，已存在的用户实例继续跑旧版本，直到该用户重新 provisioning（删除其 `/srv/dsh-users/<u>` 目录后重新登录）或在其 `profiles/web` 目录手工重跑 `pnpm install`。provisioning 每次都从 `$DSH_HOME/profiles/web/vendor/dsh-login` **重新拷贝当前源码**，因此「删目录 + 重新登录」即可让该用户拿到最新门禁（含 WebSocket `head` 透传修复）；hub 自身无需重启即可让后续 provisioning 生效；
-4. 测试：`node --test test/gate.test.mjs`（会连接真实数据库，测试账号用后即删）；`node --test test/my-models.test.mjs`（用户自助模型页，纯假宿主、**不需要数据库**）。
+4. 测试：`node --test test/gate.test.mjs`（会连接真实 MySQL，测试账号用后即删）；`node --test test/my-models.test.mjs`（用户自助模型页，纯假宿主、**不需要数据库**）；`node --test test/sqlite-store.test.mjs`（内置 SQLite 存储 + 验收脚本，**不需要数据库**）；一把跑：`npm test`（= `node --test test/`，其中 `gate.test.mjs` 需要 MySQL）；
+5. **运行时零依赖**：默认账号存储走 Node 内置的 `node:sqlite`，装插件不需要 `npm install` 任何包；只有把 `db` 配成 MySQL 时才需要在 hub 的 profile 里 `npm install mysql2`（缺依赖时插件会明确报错并提示这两条路，而不是静默换库）；
+6. 部署完跑一次验收：`node bin/verify.mjs`（见「部署完成后的验收」）。
 
 ## 安全说明
 
@@ -407,6 +501,7 @@ rm -rf /srv/dsh-users/<username>
 ## 已知边界
 
 - 数据库宕机且无有效会话时，任何人（含本机）都无法进入 GUI——这是有意的 fail-closed 行为；恢复数据库即可。
+- **内置 SQLite 存储的边界**：单文件、单写者（WAL + 5s `busy_timeout`），适合单机几十人以内的规模；多个 hub 共享同一账号表请用 MySQL。库文件里是 scrypt 口令校验值，与 `.credentials.yaml` 同属机密，**不在默认备份范围内**（要备份就单独把 `dsh-login-accounts.sqlite` 收进加密备份）。`node:sqlite` 在 Node 22 是实验特性：首次使用会打印一次 `ExperimentalWarning`（本插件不屏蔽警告），用到的 API 子集稳定；若 Node 低于 22.5 没有该模块，SQLite 后端会在启动日志与验收里明确失败——升级 Node 或改配 MySQL，不会静默降级。
 - 每个「浏览器 × 主机名」组合各自登录一次（cookie 按 Host 域隔离，浏览器标准行为）。
 - 内置桥接 cookie 寿命 30 天（DSH 内置门禁默认值）；到期前本插件会话（7 天）已先失效，用户重新登录即自动续上。
 - **每个用户实例是一个独立 node 进程**（常驻数百 MB 内存），适合中小规模用户数（单机几十人以内）；用户数多时再考虑改回单进程多租户。

@@ -41,6 +41,7 @@ import {
   clearCookieHeader,
 } from './lib/auth.js'
 import { isLoopbackPeer, ipv4InCidrs, normalizePeerIp, parseCidrList } from './lib/cidr.js'
+import { createLoginDatabase, describeDb } from './lib/db-driver.js'
 import {
   decodeInnerPayload,
   innerCookieHeader,
@@ -365,17 +366,17 @@ function installServerGate(server, decide, bridgeCookie) {
 }
 
 /**
- * Async facade over LoginDatabase: the MySQL driver (db.js) is only imported
- * on first use, so instance-mode hosts — which never touch the database — do
- * not load mysql2. The method surface mirrors LoginDatabase (all awaited by
+ * Async facade over the account store: the driver module is only imported on
+ * first use, so instance-mode hosts — which never touch the database — load
+ * neither driver, and a SQLite deployment never loads `mysql2`. The method
+ * surface mirrors both LoginDatabase and SqliteLoginDatabase (all awaited by
  * the callers); `close` is a no-op when the driver never loaded.
  */
 function createLazyDb(dbCfg) {
   let instancePromise = undefined
   const load = () => {
     if (instancePromise === undefined) {
-      instancePromise = import('./lib/db.js')
-        .then((m) => new m.LoginDatabase(dbCfg))
+      instancePromise = createLoginDatabase(dbCfg)
         .catch((err) => {
           instancePromise = undefined
           throw err
@@ -437,8 +438,8 @@ export function apply(ctx) {
     return
   }
   const cidrs = parseCidrList(cfg.allowCidrs)
-  // db.js is imported lazily (hub mode only) so instance-mode hosts never
-  // load the MySQL driver.
+  // The account-store driver is imported lazily (hub mode only) so instance-mode
+  // hosts never load it, and a SQLite hub never loads mysql2.
   const db = createLazyDb(cfg.db)
   const sessions = new SessionStore({
     ttlSec: cfg.sessionTtlSec,
@@ -1304,13 +1305,14 @@ export function apply(ctx) {
           // contribute the right-Sidebar user-management entry.
           ...(user === undefined ? {} : { username: user, admin: isAdmin(user) }),
           db: await db.health(),
+          dbDriver: cfg.db.driver,
           register: cfg.register,
           ...(instanceInfo === undefined ? {} : { instance: instanceInfo }),
         })
         return
       }
       if (path === HEALTH_PATH && req.method === 'GET') {
-        json(res, 200, { ok: true, db: await db.health() })
+        json(res, 200, { ok: true, db: await db.health(), dbDriver: cfg.db.driver })
         return
       }
       if (path === LOGOUT_PATH && (req.method === 'GET' || req.method === 'POST')) {
@@ -1467,14 +1469,14 @@ export function apply(ctx) {
   void db.ensureTable()
     .then(() => {
       console.log(
-        `dsh-login: hub gate active; db=${cfg.db.host}:${String(cfg.db.port)}/${cfg.db.database} table=${cfg.db.table}; `
+        `dsh-login: hub gate active; db=${describeDb(cfg.db)}; `
         + `register=${cfg.register}; admins=${cfg.adminUsers.length > 0 ? cfg.adminUsers.join(',') : '(none)'}; `
         + `instances=${cfg.instances.root} (portBase ${String(cfg.instances.portBase)}); cidrs=${cfg.allowCidrs.join(',')}`,
       )
     })
     .catch((err) => {
       console.error(
-        `dsh-login: database unreachable at startup (${err instanceof Error ? err.message : String(err)}); `
+        `dsh-login: database unreachable at startup (${describeDb(cfg.db)}: ${err instanceof Error ? err.message : String(err)}); `
         + 'login and register will fail until it is reachable',
       )
     })

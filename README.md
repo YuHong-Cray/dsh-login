@@ -291,7 +291,7 @@ CREATE TABLE IF NOT EXISTS "dsh_login" (
   instance.json       ← { port, pid, startedAt, provisionedAt }
   web.log             ← 实例 stdout/stderr（排障看这里）
   profiles/web/       ← 实例 profile：dsh-base + dsh-web-app + dsh-lan-access + dsh-login(file: 拷贝)
-    cordis.patch.yml  ← 真正的模型配置所在（provider / 默认模型 / 关闭 GUI 终端）
+    cordis.patch.yml  ← 真正的模型配置所在（provider / 默认模型 / 关闭 GUI 终端 / 租户完全权限）
   sessions/ storages/ ← 运行期自动创建
 ```
 
@@ -313,6 +313,14 @@ node --import <checkout>/node_modules/tsx/dist/esm/index.mjs \
 - `cwd` 即会话控制器的 `defaultCwd`：用户新建的会话默认落在**自己的目录**，不会写到 DSH 源码树或其他用户目录；
 - **实例必须与 hub 处于同一模块平面（重要，2026-09-20 修复）**：tsx 的 tsconfig `paths` 映射会把嵌套的 `@deepseek-ai/*` 导入指向 `src` 源码，而 profile 的包解析把 loader 入口加载为安装目录里的编译产物 `lib`。两者混用会加载**两份 `@deepseek-ai/dsh-tools`**：注册 `tools` 服务的那份来自 `lib/index.js`，agent loop 读取的模块私有符号 `TOOL_RUNTIME_SCHEDULER` 来自 `src/index.ts`，于是 `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 为 `undefined`，**每一次工具调用都让该轮以 `Cannot read properties of undefined (reading 'prepare')`（stop code `UNKNOWN`）失败**——症状就是普通用户会话里工具调用卡片出现后立刻「本轮运行失败」。hub 跑编译产物时实例也必须跑编译产物（此前硬编码 tsx+src，正是崩溃的来源）；
 - `TSX_TSCONFIG_PATH` 只在源码向量下注入：tsx 按「工作目录向上找 tsconfig」解析 workspace 路径映射（把 `@deepseek-ai/*` 指向源码）；缺失时会加载 checkout 里已编译的 vendor 库而启动失败（症状：`web.log` 中 `does not provide an export named ...`）。
+- **源码平面下的 checkout 文件必须对 tenant uid 可读（重要，2026-10-12）**：hub 跑源码向量时，实例是以**用户自己的 uid** 去读 `<checkout>/packages/*/src/*.ts` 的。任何一个 0600 的源文件都会让**那个包**在实例里 `failed to import`，而 hub（root）完全正常——症状是普通用户 GUI 里「右侧工作区文件」空白、deliverables 卡片一直转圈、下载没有入口（`ui-deliverables ... pending (waiting for service: workspaceFiles)` 只是连锁反应）。排查：
+  ```bash
+  find /stp-harness -path '*/node_modules' -prune -o -type f ! -perm -o+r -print | head
+  # 逐项 chmod 644（目录 755）；改权限不影响 git（git 只记录可执行位）
+  ```
+- **普通用户实例默认拥有自己目录的完全权限（2026-10-12）**：实例 profile patch 固定写入
+  `sandbox-policy.config.mode: danger-full-access` 与 `approval.config.policy: never`，
+  即**不做文件沙箱限域、不弹审批**。理由是租户之间的边界由 **uid** 决定（各家 `DSH_HOME` 是 0700 且属主为该租户），而部署默认的 `workspace-write` + `ask` 会把用户自己目录里的文件也变成只读并频繁要求审批——用户的实际体验就是「自己的文件跑不起来」。会话里仍可随时用 `/permission` 切回更窄的预设。改这段模板（`lib/instances.js` 的 `INSTANCE_PROFILE_PATCH`）会影响**此后供给/重置**的实例；已存在的实例需要改它自己的 `profiles/web/cordis.patch.yml` 后重启实例。
 
 就绪判据：实例的 `/dsh-login/health` 返回 200（120s 超时，超时则该次登录返回 503，重试即可——provisioning 幂等）。health 同时返回 `identity`（其 `DSH_HOME` 的 sha256 前 16 位），hub 用它确认「这个端口上跑的确实是我为当前目录供给的实例」。
 
@@ -408,6 +416,16 @@ node vendor/dsh-login/bin/verify.mjs --base-url "http://<局域网IP>:3080"   # 
 4. **实例页面打不开/一直转圈** → 查该实例进程与门禁：`node bin/verify.mjs --home /root/.dsh`（离线部分只读）会列出端口/进程/身份；`curl -s http://127.0.0.1:<端口>/dsh-login/health` 应返回 `{"ok":true,...}`。
 
 判断「这个账号到底有没有成功登录过」最快的两个地方：账号表的 `last_login_at`（成功验证密码后才会更新）与 hub 的会话文件 `$DSH_HOME/dsh-login-sessions.json`（只有认证通过才会写入该用户名的会话）。
+
+## 实例里看不到工作区文件 / deliverables 一直转圈
+
+先看**那个实例自己的**日志 `/srv/dsh-users/<用户名>/web.log`：
+
+- `xxx (@deepseek-ai/...): failed to import` → 该包在实例侧（tenant uid）加载失败。最常见原因是 checkout 里有 0600 的源文件（排查命令见「用户实例 provisioning 细节」）；**修完权限必须重启该实例**才会重新加载。
+- `pending (waiting for service: workspaceFiles)` → 只是上一条的连锁反应：`workspace-files` 没起来，`ui-deliverables` 就永远等不到服务，于是「右侧工作区文件」空白、deliverables 卡片转圈、下载没有入口。
+- `hmr (@deepseek-ai/dsh-hmr): EACCES ... instance.json` 是**预期内**的一条：`instance.json` 归 root 所有（0600），实例的 hmr 只能放弃监听它，不影响功能。
+
+实例重启（会让它重新加载 profile 与插件）：停掉 `instance.json` 里记录的 pid，之后**下次登录**由 hub 懒拉起即可；hub 侧任何一次 `ensure` 也会顺手拉起。
 
 ## 运维接口
 

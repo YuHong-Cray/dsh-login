@@ -93,9 +93,11 @@
 | `lib/page.js` | 登录页（自包含 HTML/CSS/JS，深色主题，登录/注册双页签） |
 | `lib/client.js` | **浏览器半边**：管理员登录后在右侧边栏「开始」页贡献「用户管理」入口，点开即在侧边栏内嵌 `/dsh-login/users`。按 client module system 的 bundle 格式手写（本插件无构建步骤），角色取自 `/dsh-login/state` 的 `admin` 字段 |
 | `bin/verify.mjs` | **部署完成后的验收流程**：配置 → 账号存储（含自动建库）→ 会话密钥 → 账号表 → HTTP 门禁往返 → 租户实例 → 隔离权限，逐条 ✔/⚠/✘ 并给修复提示，退出码 0 才算通过 |
+| `bin/passwd.mjs` | **「这个用户是不是密码不对？」**：`check <用户名>` 只读比对（输入不回显，只打印 ✅/❌），`set <用户名>` 重置密码（只改 `password_hash`，不动状态/实例/工作区/既有会话）。见「用户登录不上时的排查顺序」 |
 | `cordis.patch.yml` | bundle 补丁：向 profile 树插入插件行 |
 | `test/gate.test.mjs` | 集成测试（假宿主 + 真实 MySQL + 租户原语） |
 | `test/sqlite-store.test.mjs` | 内置 SQLite 存储测试（驱动选择矩阵、与 MySQL 驱动的方法面一致性、老表补列、文件 0600、`bin/verify.mjs` 离线验收；**不需要 MySQL**） |
+| `test/passwd-cli.test.mjs` | `bin/passwd.mjs` 端到端测试（临时 SQLite 账号库 + 真子进程/真 stdin：密码对 ✅、密码错 ❌、重置只改哈希、两次不一致/长度越界被拒、instance 模式拒绝；**不需要 MySQL**） |
 | `test/admin-instance-next.test.mjs` | 管理员 `next` 指向实例端口时改走进入确认页的回归测试（**不需要 MySQL**） |
 | `test/my-models.test.mjs` | 用户自助模型页测试（预设表/校验/写入序列/自设开关镜像与门禁/假宿主集成；**不需要 MySQL**） |
 | `test/client-half.test.mjs` | 浏览器半边测试（VM 内执行 bundle + 假 ctx/fetch：管理员注册入口、非管理员不注册；**不需要 MySQL**） |
@@ -390,6 +392,22 @@ node vendor/dsh-login/bin/verify.mjs --base-url "http://<局域网IP>:3080"   # 
 ```
 
 （在插件目录里直接跑 `node bin/verify.mjs` 也一样；`npm run verify` 是同一件事。验收不依赖 `DSH_HOME` 环境变量——它按 `--home` 读配置。）
+
+## 用户登录不上时的排查顺序
+
+先分清失败发生在**哪一跳**，别在实例侧乱猜——两者的现象和修法完全不同：
+
+1. **连登录页都看不到**（403「拒绝访问」）→ 请求根本没进门禁：来源 IP 不在 `allowCidrs`，或带了 `X-Forwarded-For` 之类的代理头（`rejectProxyHeaders`）。页面上会写明原因。
+2. **登录页能打开，提交后报错** → 逐字看错误文案：
+   - 「用户名或密码错误」→ 密码不对（**最常见**）。用 `node bin/passwd.mjs check <用户名>` 复核，`set <用户名>` 重置；
+   - 「尝试次数过多，请 15 分钟后再试」→ 同一来源 IP 15 分钟内连错 ≥10 次被限流（计数在 hub 进程内存里，重启 hub 即清零，改密码**不会**清）；
+   - 「请求来源不合法」→ 浏览器 `Origin` 与 `Host` 不一致（反向代理改写 Host 之类）；
+   - 「数据库暂不可用」→ 账号库连不上（同机其他账号能登录就说明不是这条）；
+   - 「正在等待管理员审批」→ 账号 `status` 还不是 `approved`，去「用户管理」点通过。
+3. **登录成功但落到实例又被弹回登录页** → 浏览器手里没有那个端口的实例 cookie，且 hub 没有为这次跳转铸造 handoff。管理员从地址栏直接开实例端口就属于这种：现在会被改写为进入确认页（见「关键机制」）——**这条修复要重启 hub 才生效**。
+4. **实例页面打不开/一直转圈** → 查该实例进程与门禁：`node bin/verify.mjs --home /root/.dsh`（离线部分只读）会列出端口/进程/身份；`curl -s http://127.0.0.1:<端口>/dsh-login/health` 应返回 `{"ok":true,...}`。
+
+判断「这个账号到底有没有成功登录过」最快的两个地方：账号表的 `last_login_at`（成功验证密码后才会更新）与 hub 的会话文件 `$DSH_HOME/dsh-login-sessions.json`（只有认证通过才会写入该用户名的会话）。
 
 ## 运维接口
 

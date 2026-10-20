@@ -238,6 +238,22 @@ CREATE TABLE IF NOT EXISTS "dsh_login" (
 - `adminUsers`：管理员账号列表（2–32 位，字符集同用户名规则）；**留空/省略 = 无管理员**（所有用户都走独立实例）。管理员**不受注册审批约束**。
 - `register`：`open` 开放自助注册；`disabled` 关闭注册（登录页只保留登录页签）。
 - `requireApproval`：**注册审批开关，默认 `true`**。开启时自助注册的账号以 `pending` 写入数据库、**不自动登录、不分配实例**，必须由管理员在「用户管理」里点「通过」后才能登录；设为 `false` 则恢复"注册即登录"的旧行为。（管理员账号始终直接可用。）
+- `instances.extraDependencies` / `instances.extraBundles`：**让新供给的用户实例默认带上功能插件**。默认均为空（新实例只含 `dsh-lan-access` + `dsh-login` 基线）；把它们设成与已有用户一致的插件后，**以后新增的每个用户**都会自动装齐，而不必逐人手动 `dsh plugin add`。例：
+
+  ```json
+  "instances": {
+    "extraDependencies": {
+      "dsh-remote-development": "link:/opt/dsh-plugins/dsh-remote-development",
+      "dsh-nccl": "link:/opt/dsh-plugins/dsh-nccl",
+      "ttot-chat": "link:/opt/dsh-plugins/ttot-chat",
+      "dsh-easyrewrite": "^2.6.0",
+      "dsh-undo-savepoint": "^0.4.10"
+    },
+    "extraBundles": ["dsh-remote-development", "dsh-nccl", "ttot-chat", "dsh-easyrewrite", "dsh-undo-savepoint"]
+  }
+  ```
+
+  注意：`link:` 指向的插件源要在**该机器上可读**且**租户 uid 可读**（`/opt/dsh-plugins/*` 需 `r-x`）；npm 版本号依赖需在 pnpm store / registry 可用。这两个字段只对新供给（`provision()`）的实例生效，已存在实例的 profile 不受影响。
 
 ### 注册审批流程
 

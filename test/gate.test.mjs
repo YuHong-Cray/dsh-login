@@ -532,6 +532,37 @@ describe('dsh-login primitives', () => {
     assert.equal(ok.db.table, 'dsh_login')
     assert.equal(ok.register, 'open')
   })
+
+  it('normalizeConfig merges instance feature plugins and drops invalid entries', () => {
+    const cfg = normalizeConfig({
+      db: { host: 'h', user: 'u', password: 'p', database: 'd' },
+      instances: {
+        extraDependencies: {
+          'dsh-remote-development': 'link:/opt/dsh-plugins/dsh-remote-development',
+          'dsh-nccl': 'link:/opt/dsh-plugins/dsh-nccl',
+          'bad name': 'x',            // invalid key (space) -> dropped
+          'dsh-easyrewrite': '',      // empty spec -> dropped
+          'dsh-undo-savepoint': { a: 1 }, // non-string spec -> dropped
+        },
+        extraBundles: [
+          'dsh-remote-development',
+          'dsh-nccl',
+          'not a bundle',             // space -> dropped
+          '',                          // empty -> dropped
+          42,                          // non-string -> dropped
+        ],
+      },
+    })
+    assert.deepEqual(cfg.instances.extraDependencies, {
+      'dsh-remote-development': 'link:/opt/dsh-plugins/dsh-remote-development',
+      'dsh-nccl': 'link:/opt/dsh-plugins/dsh-nccl',
+    })
+    assert.deepEqual(cfg.instances.extraBundles, ['dsh-remote-development', 'dsh-nccl'])
+    // Absent -> empty (so a plain deployment keeps the baseline profile).
+    const def = normalizeConfig({ db: { host: 'h', user: 'u', password: 'p', database: 'd' } })
+    assert.deepEqual(def.instances.extraDependencies, {})
+    assert.deepEqual(def.instances.extraBundles, [])
+  })
 })
 
 describe('dsh-login tenancy primitives', () => {

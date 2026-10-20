@@ -513,6 +513,8 @@ export function apply(ctx) {
         osUserPrefix: cfg.instances.osUserPrefix,
         maxOldSpaceMb: cfg.instances.maxOldSpaceMb,
         nprocLimit: cfg.instances.nprocLimit,
+        extraDependencies: cfg.instances.extraDependencies,
+        extraBundles: cfg.instances.extraBundles,
         // Each instance shares exactly ONE credential with the hub: the
         // browser-session signing secret the handoff is minted with. Model
         // choices and provider API keys start empty for every user.

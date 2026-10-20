@@ -42,6 +42,40 @@
 - 用户实例绑定 `0.0.0.0`（复用 `dsh-lan-access`），局域网可达；每个实例受自己的门禁保护；
 - 用户实例以 **detached** 方式启动：hub 重启（含 Ctrl+C）不连带杀死；hub 重启时从 `instance.json` 重新**收养**；实例进程挂掉时下次登录**懒拉起**。
 
+## 权限模型（管理员 vs 普通用户）
+
+**本插件的权限与访问空间划分全部不需要改动 stp-harness 源码**，只由三部分组成：本插件、部署配置（`$DSH_HOME/dsh-login.json`）、账号表（MySQL/SQLite）。下面逐层说明。
+
+### 管理员身份与权限
+
+- **判定**：`isAdmin(u) = cfg.adminUsers.includes(u)`，`adminUsers` 在 hub 的 `$DSH_HOME/dsh-login.json` 里配置（例如 `["wyh"]`）。它**来自部署配置、不是数据库**，因此管理员账号天然不经过数据库审批流（代码里的审批闸门是 `if (!isAdmin(u) && status !== 'approved')`）。
+- **使用面**：登录后直接进入 **hub 应用（3080）**，行为与单用户门禁时代一致；登录时额外拿到内层 cookie（`withInnerCookie=true`，只发给管理员）。
+- **管理能力**（每个端点都有 `if (!isAdmin(self))` 防线）：用户管理页 `/dsh-login/users`（批准/拒绝、删除用户、模型自助开关）+ `/dsh-login/enter`（以某用户身份进入其环境，属排障/代管特权）。
+
+### 普通用户身份与权限
+
+- **只允许 hub 的登录面**：`decide()` 对普通用户（非管理员、且路径不在 `/dsh-login/*` 前缀下）一律 `instance-surface` 重定向。也就是说普通用户**无法访问 hub 应用本体**（3080 上的工作区、会话、管理页都不行），只能到自己的实例。
+- **登录后**：hub 铸造短时 handoff → 302 到该用户实例端口 → 实例校验并转换成长效内置 cookie，此后一切请求都落在该实例上。
+- **`/dsh-login/state`** 将其标记为 `admin:false`，浏览器端据此隐藏右侧「用户管理」入口；普通用户只能看到自己的「我的模型」页面。
+
+### 权限管理载体（各在哪一层强制）
+
+| 能力 / 权限 | 载体 | 在哪儿强制 |
+| --- | --- | --- |
+| 能否登录 | 账号表 `status`（`pending/approved/rejected`）+ 审批流 | hub 登录端点 |
+| 是否管理员 | 配置 `adminUsers` | hub 全体 `/dsh-login/*` 端点 |
+| 能否自行设置模型 | 账号表 `model_self_service` → 同步到实例 `dsh-login-model-policy.json` | **实例侧** `lib/model-policy.js`（fail-closed，缺失按禁止） |
+| 网络可达性 | 配置 `allowCidrs` + `rejectProxyHeaders` | hub 与实例的 gate 都强制 |
+| 独立工作区/端口/进程 | 配置 `instances.*`（root/portBase/isolation） | `lib/instances.js` |
+
+> 想增删管理员：改 `adminUsers` 数组（新账号需重新登录后按新配置判定）；想逐人放开「模型自助」：在用户管理页开对应开关（对应 `model_self_service`）。
+
+### 访问空间隔离（不依赖 stp-harness）
+
+详见「多租户隔离（UID 降权）」一节，要点是：每个普通用户拥有**独立 DSH_HOME、独立端口、独立进程、独立 settings/credentials**，并运行在**各自非特权 OS 账号**下（`runuser -u dsh-<user>-<hash> …`）；实例根 `/srv/dsh-users` 为 `0711` 只许穿过不可列举；hub 与实例共享的唯一凭据是 `browser-session` 签名密钥（handoff 校验用），普通用户实例**不继承 hub 任何 API key / 模型配置**。
+
+这三层——账号表+配置的**权限**、uid 隔离的**空间**、CIDR 的**网络**——均只经插件/配置实现，**无需触碰 stp-harness 源码**；若要在插件层做更细的划分（如按用户限模型数量、CPU/GPU 配额、只读共享目录），也是扩展现有插件或新增插件，同样不动 stp-harness。
+
 ## 工作流程（hub 模式）
 
 ```

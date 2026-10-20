@@ -9,9 +9,12 @@
  *     disagree between the mounted ToolRuntime and the agent loop, and every
  *     tool call fails its turn with
  *     `Cannot read properties of undefined (reading 'prepare')`.
- *  2. The profile patch: no GUI terminals, and full permission on the tenant's
- *     own home. The second half is what keeps "run a file in my own workspace"
- *     from being answered with a sandbox denial or an approval prompt.
+ *  2. The profile patch: no GUI terminals, full permission on the tenant's
+ *     own home, and the shared local model (deepseek-v4-flash-vision-exp on
+ *     172.19.1.176:30000/v1) granted as the default provider with its context
+ *     window and compaction policy declared. The second half is what keeps
+ *     "run a file in my own workspace" from being answered with a sandbox
+ *     denial or an approval prompt.
  *
  * Run:  node --test test/instance-vector.test.mjs
  */
@@ -75,11 +78,14 @@ test('the instance profile grants full permission on the tenant own home', () =>
   assert.equal(rows.get('approval'), '  config:\n    policy: never')
 })
 
-test('the instance profile patches nothing else', () => {
+test('the instance profile declares exactly the tenant baseline plus the shared model', () => {
   assert.deepEqual([...rows.keys()], [
     'terminal-controller',
     'ui-sidebar-terminal',
     'sandbox-policy',
     'approval',
+    'llm-pi-ai',
+    'agent-default-model',
+    'preset-standard',
   ])
 })

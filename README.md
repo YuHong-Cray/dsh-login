@@ -561,6 +561,61 @@ rm -rf /srv/dsh-users/<username>
 
 ## 安装 / 升级
 
+### 在另一台机器上安装（从 GitHub）
+
+本插件**不在 `stp-harness` 仓库里**，它是独立仓库 `github.com/YuHong-Cray/dsh-login`。新机器只 clone `stp-harness` 是拿不到登录门的，必须在自己的 web profile 里**显式添加这个依赖**：
+
+```sh
+# 1. 运行一次 dsh web，让 DSH 生成 profile 目录（$DSH_HOME/profiles/web）
+DSH_HOME=~/.dsh dsh web --no-open    # Ctrl-C 停掉即可，本次只为生成 profile
+
+# 2. 编辑 $DSH_HOME/profiles/web/package.json，加依赖 + bundle
+```
+
+`$DSH_HOME/profiles/web/package.json` 形如：
+
+```json
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": {
+    "dsh-login": "github:YuHong-Cray/dsh-login"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-login"
+      ]
+    }
+  }
+}
+```
+
+```sh
+# 3. 安装依赖并重启 dsh web
+cd "$DSH_HOME/profiles/web" && pnpm install
+dsh web
+```
+
+启动日志出现下面这行即成功（**数据库字段说明它走的是内置 SQLite**）：
+
+```
+dsh-login: hub gate active; db=sqlite:<...>/dsh-login-accounts.sqlite table=dsh_login; ...
+```
+
+访问 `http://127.0.0.1:3080/` 会被 302 到 `/dsh-login/login`。
+
+**关于数据库（新机器没有 MySQL 也能用）**：账号存储按 `$DSH_HOME/dsh-login.json` 的 `db.driver` 选择，默认 `auto` —— 只有同时配置了 `db.host` + `db.user` + `db.database` 才走 MySQL，**否则自动使用 Node 内置 `node:sqlite`**（`$DSH_HOME/dsh-login-accounts.sqlite`，首次使用时自动建表，0600）。因此：
+
+- **独立开发机 / 单机部署**：什么都不配即可，注册与登录直接落 SQLite，无需 MySQL、无需 `mysql2`；
+- **要接入现有的共享账号表**（例如团队已有的 MySQL 账号库）：在 `dsh-login.json` 里填 `db.host`/`db.user`/`db.password`/`db.database`，并在 profile 里 `pnpm add mysql2`（唯一可选依赖，缺了插件会明确报错并提示这两条路，不会静默换库）。
+
+数据不迁移：SQLite 与 MySQL 是两套独立账号表，两者之间的账号不会自动同步。
+
+### 本机（源码 vendor 方式）
+
 本插件位于 web profile 的 `vendor/dsh-login` 目录，并已纳入 profile 的 pnpm workspace（`pnpm-workspace.yaml` 的 `vendor/*`，profile 依赖 `"dsh-login": "workspace:*"`），`node_modules/dsh-login` 是指向本目录的符号链接：
 
 1. 修改插件源码后**无需构建**（纯 ESM JS），也无需重新 `pnpm install`（符号链接即时生效），只需重启 `dsh web` 使插件代码生效；

@@ -564,11 +564,16 @@ export function apply(ctx) {
     .catch(() => {})
 
   /**
-   * Start (once) the read of the inner browser-session signing secret and
-   * return its promise; the cached promise also resolves when the record is
-   * absent, so callers can await it before minting.
+   * Read the inner browser-session signing secret, caching only a real hit.
+   *
+   * The secret is written by the host's browser-auth on first bootstrap, which
+   * can happen after this plugin's first probe. A probe that found no record
+   * must therefore not be cached: doing so pinned `undefined` for the life of
+   * the process and turned every later regular-user login into a 503.
+   * @returns the 32-byte signing secret, or undefined when no record exists yet.
    */
   const ensureInnerSecret = () => {
+    if (innerSecret !== undefined) return Promise.resolve(innerSecret)
     if (innerSecretPromise === undefined) {
       innerSecretPromise = readInnerSecret(ctx.credentials)
         .then((secret) => {
@@ -576,6 +581,7 @@ export function apply(ctx) {
           return secret
         })
         .catch(() => undefined)
+        .finally(() => { innerSecretPromise = undefined })
     }
     return innerSecretPromise
   }
